@@ -145,6 +145,74 @@ _C.MODEL.SIMMIM.NORM_TARGET = CN()
 _C.MODEL.SIMMIM.NORM_TARGET.ENABLE = False
 _C.MODEL.SIMMIM.NORM_TARGET.PATCH_SIZE = 47
 
+# Swin Transformer with Alzheimer MoE parameters
+_C.MODEL.SWIN_ADMOE = CN()
+_C.MODEL.SWIN_ADMOE.PATCH_SIZE = 4
+_C.MODEL.SWIN_ADMOE.IN_CHANS = 3
+_C.MODEL.SWIN_ADMOE.EMBED_DIM = 96
+_C.MODEL.SWIN_ADMOE.DEPTHS = [2, 2, 6, 2]
+_C.MODEL.SWIN_ADMOE.NUM_HEADS = [3, 6, 12, 24]
+_C.MODEL.SWIN_ADMOE.WINDOW_SIZE = 7
+_C.MODEL.SWIN_ADMOE.MLP_RATIO = 4.
+_C.MODEL.SWIN_ADMOE.QKV_BIAS = True
+_C.MODEL.SWIN_ADMOE.APE = False
+_C.MODEL.SWIN_ADMOE.PATCH_NORM = True
+_C.MODEL.SWIN_ADMOE.PRETRAINED_WINDOW_SIZES = [0, 0, 0, 0]
+_C.MODEL.SWIN_ADMOE.SHIFT_MLP_RATIO = 1.0
+_C.MODEL.SWIN_ADMOE.IS_PRETRAIN = True
+_C.MODEL.SWIN_ADMOE.USE_SHIFTED_LAST_LAYER = False
+# Dual-task specific parameters
+_C.MODEL.SWIN_ADMOE.NUM_CLASSES_DIAGNOSIS = 3
+_C.MODEL.SWIN_ADMOE.NUM_CLASSES_CHANGE = 3
+
+# Add these after the _C.TEST section
+
+# -----------------------------------------------------------------------------
+# Loss settings
+# -----------------------------------------------------------------------------
+_C.LOSS = CN()
+_C.LOSS.WEIGHT_DIAGNOSIS = 1.0
+_C.LOSS.WEIGHT_CHANGE = 1.0
+
+# -----------------------------------------------------------------------------
+# Evaluation settings
+# -----------------------------------------------------------------------------
+_C.EVAL = CN()
+_C.EVAL.INTERVAL = 10
+_C.EVAL.SAVE_BEST = True
+_C.EVAL.METRICS = ['accuracy', 'f1_score', 'confusion_matrix']
+
+# -----------------------------------------------------------------------------
+# Early stopping settings
+# -----------------------------------------------------------------------------
+_C.EARLY_STOP = CN()
+_C.EARLY_STOP.ENABLE = True
+_C.EARLY_STOP.PATIENCE = 5
+_C.EARLY_STOP.MONITOR = 'val_loss'
+
+# -----------------------------------------------------------------------------
+# WandB settings
+# -----------------------------------------------------------------------------
+_C.WANDB = CN()
+_C.WANDB.PROJECT = 'alzheimer-classification'
+_C.WANDB.NAME = 'experiment'
+_C.WANDB.TAGS = []
+
+# Add this in the _update_config_from_file function to handle encoding
+def _update_config_from_file(config, cfg_file):
+    config.defrost()
+    with open(cfg_file, 'r', encoding='utf-8') as f:  # Add encoding='utf-8'
+        yaml_cfg = yaml.load(f, Loader=yaml.FullLoader)
+
+    for cfg in yaml_cfg.setdefault('BASE', ['']):
+        if cfg:
+            _update_config_from_file(
+                config, os.path.join(os.path.dirname(cfg_file), cfg)
+            )
+    print('=> merge config from {}'.format(cfg_file))
+    config.merge_from_file(cfg_file)
+    config.freeze()
+
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
@@ -235,6 +303,36 @@ _C.TEST.SEQUENTIAL = False
 _C.TEST.SHUFFLE = False
 
 # -----------------------------------------------------------------------------
+# Loss settings
+# -----------------------------------------------------------------------------
+_C.LOSS = CN()
+_C.LOSS.WEIGHT_DIAGNOSIS = 1.0
+_C.LOSS.WEIGHT_CHANGE = 1.0
+
+# -----------------------------------------------------------------------------
+# Evaluation settings
+# -----------------------------------------------------------------------------
+_C.EVAL = CN()
+_C.EVAL.INTERVAL = 10
+_C.EVAL.SAVE_BEST = True
+_C.EVAL.METRICS = ['accuracy', 'f1_score', 'confusion_matrix']
+
+# -----------------------------------------------------------------------------
+# Early stopping settings
+# -----------------------------------------------------------------------------
+_C.EARLY_STOP = CN()
+_C.EARLY_STOP.ENABLE = True
+_C.EARLY_STOP.PATIENCE = 5
+_C.EARLY_STOP.MONITOR = 'val_loss'
+
+# -----------------------------------------------------------------------------
+# WandB settings
+# -----------------------------------------------------------------------------
+_C.WANDB = CN()
+_C.WANDB.PROJECT = 'alzheimer-classification'
+_C.WANDB.NAME = 'experiment'
+_C.WANDB.TAGS = []
+# -----------------------------------------------------------------------------
 # Misc
 # -----------------------------------------------------------------------------
 # [SimMIM] Whether to enable pytorch amp, overwritten by command line argument
@@ -267,7 +365,7 @@ _C.FUSED_LAYERNORM = False
 
 def _update_config_from_file(config, cfg_file):
     config.defrost()
-    with open(cfg_file, 'r') as f:
+    with open(cfg_file, 'r', encoding='utf-8') as f:
         yaml_cfg = yaml.load(f, Loader=yaml.FullLoader)
 
     for cfg in yaml_cfg.setdefault('BASE', ['']):
@@ -341,7 +439,8 @@ def update_config(config, args):
     if PYTORCH_MAJOR_VERSION == 1:
         config.LOCAL_RANK = args.local_rank
     else:
-        config.LOCAL_RANK = int(os.environ['LOCAL_RANK'])
+        # For PyTorch 2.x, safely get LOCAL_RANK with fallback
+        config.LOCAL_RANK = int(os.environ.get('LOCAL_RANK', args.local_rank))
 
     # output folder
     config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)

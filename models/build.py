@@ -9,6 +9,7 @@ from .swin_transformer import SwinTransformer
 from .swin_transformer_v2 import SwinTransformerV2
 from .swin_transformer_moe import SwinTransformerMoE
 from .swin_mlp import SwinMLP
+from .swin_transformer_v2_mtad_ptft import SwinTransformerV2_AlzheimerMoE
 from .simmim import build_simmim
 
 
@@ -115,7 +116,34 @@ def build_model(config, is_pretrain=False):
                         ape=config.MODEL.SWIN_MLP.APE,
                         patch_norm=config.MODEL.SWIN_MLP.PATCH_NORM,
                         use_checkpoint=config.TRAIN.USE_CHECKPOINT)
+    elif model_type == 'swin_admoe':
+        model = SwinTransformerV2_AlzheimerMoE(
+            img_size=config.DATA.IMG_SIZE,
+            patch_size=getattr(config.MODEL.SWIN_ADMOE, 'PATCH_SIZE', 4),
+            in_chans=getattr(config.MODEL.SWIN_ADMOE, 'IN_CHANS', 3),
+            # 双任务类别数设置
+            num_classes=config.MODEL.NUM_CLASSES,  # 保留兼容性
+            num_classes_diagnosis=getattr(config.MODEL.SWIN_ADMOE, 'NUM_CLASSES_DIAGNOSIS', 3),
+            num_classes_change=getattr(config.MODEL.SWIN_ADMOE, 'NUM_CLASSES_CHANGE', 3),
+            embed_dim=getattr(config.MODEL.SWIN_ADMOE, 'EMBED_DIM', 96),
+            depths=getattr(config.MODEL.SWIN_ADMOE, 'DEPTHS', [2, 2, 6, 2]),
+            num_heads=getattr(config.MODEL.SWIN_ADMOE, 'NUM_HEADS', [3, 6, 12, 24]),
+            window_size=getattr(config.MODEL.SWIN_ADMOE, 'WINDOW_SIZE', 7),
+            mlp_ratio=getattr(config.MODEL.SWIN_ADMOE, 'MLP_RATIO', 4.),
+            qkv_bias=getattr(config.MODEL.SWIN_ADMOE, 'QKV_BIAS', True),
+            drop_rate=config.MODEL.DROP_RATE,
+            attn_drop_rate=getattr(config.MODEL, 'ATTN_DROP_RATE', 0.),
+            drop_path_rate=config.MODEL.DROP_PATH_RATE,
+            norm_layer=layernorm,
+            ape=getattr(config.MODEL.SWIN_ADMOE, 'APE', False),
+            patch_norm=getattr(config.MODEL.SWIN_ADMOE, 'PATCH_NORM', True),
+            use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+            pretrained_window_sizes=getattr(config.MODEL.SWIN_ADMOE, 'PRETRAINED_WINDOW_SIZES', [0, 0, 0, 0]),
+            shift_mlp_ratio=getattr(config.MODEL.SWIN_ADMOE, 'SHIFT_MLP_RATIO', 1.0),
+            is_pretrain=getattr(config.MODEL.SWIN_ADMOE, 'IS_PRETRAIN', True),
+            use_shifted_last_layer=getattr(config.MODEL.SWIN_ADMOE, 'USE_SHIFTED_LAST_LAYER', False))
     else:
-        raise NotImplementedError(f"Unkown model: {model_type}")
+        raise NotImplementedError(f"Unknown model: {model_type}")
+
 
     return model

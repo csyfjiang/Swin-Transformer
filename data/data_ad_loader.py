@@ -1,114 +1,107 @@
 """
-Description: 阿尔兹海默症NPZ格式数据加载器
-Author: Modified for Alzheimer's NPZ data
-Date: 2025/1/25
+简化版阿尔兹海默症NPZ数据加载器
+- 只保留裁剪和旋转增强
+- 去除所有归一化（因为数据已经z-score标准化）
+- 打印数据范围
 """
 import os
 import glob
 import random
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
-import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader
 from scipy import ndimage
 from scipy.ndimage import zoom
+from PIL import Image
+import matplotlib.pyplot as plt
 from torchvision import transforms
+import torch.distributed as dist
+from torch.utils.data import DistributedSampler
 from timm.data import Mixup
+# 注意：如果没有安装timm，可以注释掉下面的导入
+try:
+    from timm.data.random_erasing import RandomErasing
+    from timm.data.auto_augment import rand_augment_transform
+    TIMM_AVAILABLE = True
+except ImportError:
+    print("Warning: timm not installed, some augmentations will be disabled")
+    TIMM_AVAILABLE = False
 
 
 def random_rot_flip(image):
-    """随机旋转和翻转图像"""
+    """随机旋转90度的倍数（只保留90度旋转，去除翻转）"""
     k = np.random.randint(0, 4)
     image = np.rot90(image, k)
-    axis = np.random.randint(0, 2)
-    image = np.flip(image, axis=axis).copy()
+    # 注释掉翻转
+    # axis = np.random.randint(0, 2)
+    # image = np.flip(image, axis=axis).copy()
     return image
 
 
 def random_rotate(image):
-    """随机旋转图像"""
+    """随机小角度旋转"""
     angle = np.random.randint(-20, 20)
     image = ndimage.rotate(image, angle, order=3, reshape=False)
     return image
 
 
-class AlzheimerTransform(object):
-    """阿尔兹海默症数据的变换类"""
-    def __init__(self, output_size, is_train=True, normalize=True):
-        self.output_size = output_size
-        self.is_train = is_train
-        self.normalize = normalize
-        # 医学图像通常使用不同的归一化参数
-        self.mean = 0.5
-        self.std = 0.5
+class NPZToTensor(object):
+    """将NPZ数据转换为Tensor - 不做任何归一化"""
+    def __init__(self, print_stats=False):
+        self.print_stats = print_stats
+        self.first_print = True
 
-    def __call__(self, sample):
-        image = sample['slice']
-        label = sample['label']
-        change_label = sample['change_label']
+    def __call__(self, image):
+        # 如果是PIL图像，先转为numpy
+        if isinstance(image, Image.Image):
+            image = np.array(image)
 
-        # 数据增强（仅在训练时）
-        if self.is_train:
-            if random.random() > 0.5:
-                image = random_rot_flip(image)
-            elif random.random() > 0.5:
-                image = random_rotate(image)
-
-        # 调整图像大小
-        h, w = image.shape
-        if h != self.output_size[0] or w != self.output_size[1]:
-            zoom_h = self.output_size[0] / h
-            zoom_w = self.output_size[1] / w
-            image = zoom(image, (zoom_h, zoom_w), order=3)
-
-        # 转换为float32并归一化到[0, 1]
+        # 确保是float32
         image = image.astype(np.float32)
-        if image.max() > 1.0:
-            image = image / image.max()
 
-        # 扩展为3通道（复制灰度图到RGB）
-        image = np.stack([image, image, image], axis=0)
+        # ===== 打印数据范围 =====
+        if self.print_stats and self.first_print:
+            print(f"\n[数据统计] Z-score标准化后的数据:")
+            print(f"  - 范围: [{image.min():.4f}, {image.max():.4f}]")
+            print(f"  - 均值: {image.mean():.4f}")
+            print(f"  - 标准差: {image.std():.4f}")
+            self.first_print = False
 
-        # 归一化
-        if self.normalize:
-            image = (image - self.mean) / self.std
+        # ===== 删除归一化代码 =====
+        # 不再归一化到[0, 1]，保持z-score数据不变
+        # if image.max() > 1.0:
+        #     image = image / 255.0
+
+        # 如果是2D图像，扩展为3通道
+        if len(image.shape) == 2:
+            image = np.stack([image, image, image], axis=2)
+
+        # 转换为CHW格式
+        image = np.transpose(image, (2, 0, 1))
 
         # 转换为tensor
         image = torch.from_numpy(image).float()
-        label = torch.tensor(label, dtype=torch.long)
-        change_label = torch.tensor(change_label, dtype=torch.long)
 
-        return {
-            'image': image,
-            'label': label,
-            'change_label': change_label,
-            'case_name': sample['case_name']
-        }
+        # ===== 删除标准化代码 =====
+        # 不再做(x-mean)/std，保持z-score数据不变
+        # if self.normalize:
+        #     image = (image - self.mean) / self.std
+
+        return image
 
 
 class AlzheimerNPZDataset(Dataset):
     """阿尔兹海默症NPZ数据集"""
-    def __init__(self, data_dir, split='train', transform=None, file_list=None):
-        """
-        Args:
-            data_dir: NPZ文件所在的目录
-            split: 'train', 'val', 或 'test'
-            transform: 数据变换
-            file_list: 文件列表路径，如果为None则自动查找所有NPZ文件
-        """
+    def __init__(self, data_dir, split='train', transform=None, file_list=None, debug=False):
         self.data_dir = data_dir
         self.split = split
         self.transform = transform
+        self.debug = debug
 
         # 获取文件列表
-        if file_list and os.path.exists(file_list):
-            # 从文件列表读取
-            with open(file_list, 'r') as f:
-                self.files = [line.strip() for line in f.readlines()]
-                # 确保文件名以.npz结尾
-                self.files = [f if f.endswith('.npz') else f + '.npz' for f in self.files]
+        if file_list:
+            self.files = file_list
         else:
-            # 自动查找所有NPZ文件
             self.files = glob.glob(os.path.join(data_dir, '*.npz'))
             self.files = [os.path.basename(f) for f in self.files]
 
@@ -123,17 +116,37 @@ class AlzheimerNPZDataset(Dataset):
     def __getitem__(self, idx):
         # 加载NPZ文件
         file_name = self.files[idx]
-        file_path = os.path.join(self.data_dir, file_name)
+        if not file_name.startswith(self.data_dir):
+            file_path = os.path.join(self.data_dir, file_name)
+        else:
+            file_path = file_name
 
         try:
             data = np.load(file_path)
+
+            # 获取2D切片数据
+            slice_data = data['slice'].astype(np.float32)
+
+            # 调试模式：打印原始数据信息
+            if self.debug and idx == 0:
+                print(f"\n[调试] 原始NPZ数据:")
+                print(f"  - 文件: {file_name}")
+                print(f"  - Shape: {slice_data.shape}")
+                print(f"  - 范围: [{slice_data.min():.4f}, {slice_data.max():.4f}]")
+                print(f"  - 均值: {slice_data.mean():.4f}, 标准差: {slice_data.std():.4f}")
+
+            # 获取标签
+            label = int(data['label'][()]) if data['label'].shape == () else int(data['label'])
+            change_label = int(data['change_label'][()]) if data['change_label'].shape == () else int(data['change_label'])
+
+            # 创建样本字典
             sample = {
-                'slice': data['slice'],
-                'label': int(data['label'][()]) if data['label'].shape == () else int(data['label']),
-                'change_label': int(data['change_label'][()]) if data['change_label'].shape == () else int(data['change_label']),
-                'prior': data['prior'] if 'prior' in data else np.zeros(3),
-                'case_name': os.path.splitext(file_name)[0]
+                'slice': slice_data,
+                'label': label,
+                'change_label': change_label,
+                'case_name': os.path.splitext(os.path.basename(file_name))[0]
             }
+
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
             raise
@@ -145,86 +158,156 @@ class AlzheimerNPZDataset(Dataset):
         return sample
 
 
+class AlzheimerTransform(object):
+    """简化的transform类 - 只保留裁剪和旋转"""
+    def __init__(self, output_size, is_train=True, use_crop=True, use_rotation=True, print_stats=False):
+        self.output_size = output_size
+        self.is_train = is_train
+        self.use_crop = use_crop
+        self.use_rotation = use_rotation
+        self.to_tensor = NPZToTensor(print_stats=print_stats)
+
+    def __call__(self, sample):
+        image = sample['slice']
+
+        # ===== 1. 旋转增强（仅训练时）=====
+        if self.is_train and self.use_rotation:
+            if random.random() > 0.5:
+                # 90度旋转
+                image = random_rot_flip(image)
+            elif random.random() > 0.5:
+                # 小角度旋转
+                image = random_rotate(image)
+
+        # ===== 2. 裁剪或调整大小 =====
+        h, w = image.shape
+
+        if self.is_train and self.use_crop:
+            # 训练时：随机裁剪
+            # 先放大一点（1.1-1.2倍），然后随机裁剪
+            scale_factor = random.uniform(1.1, 1.2)
+            new_h = int(self.output_size[0] * scale_factor)
+            new_w = int(self.output_size[1] * scale_factor)
+
+            # 缩放到稍大的尺寸
+            if h != new_h or w != new_w:
+                zoom_h = new_h / h
+                zoom_w = new_w / w
+                image = zoom(image, (zoom_h, zoom_w), order=3)
+
+            # 随机裁剪到目标大小
+            h, w = image.shape
+            if h > self.output_size[0] and w > self.output_size[1]:
+                top = random.randint(0, h - self.output_size[0])
+                left = random.randint(0, w - self.output_size[1])
+                image = image[top:top+self.output_size[0], left:left+self.output_size[1]]
+            else:
+                # 如果图像小于目标大小，直接缩放
+                zoom_h = self.output_size[0] / h
+                zoom_w = self.output_size[1] / w
+                image = zoom(image, (zoom_h, zoom_w), order=3)
+        else:
+            # 验证时：直接缩放到目标大小
+            if h != self.output_size[0] or w != self.output_size[1]:
+                zoom_h = self.output_size[0] / h
+                zoom_w = self.output_size[1] / w
+                image = zoom(image, (zoom_h, zoom_w), order=3)
+
+        # ===== 3. 删除所有其他增强 =====
+        # 不使用：颜色增强、timm增强、随机擦除等
+
+        # ===== 4. 转换为tensor（不做归一化）=====
+        image = self.to_tensor(image)
+
+        # 返回最终格式
+        return {
+            'image': image,
+            'label': torch.tensor(sample['label'], dtype=torch.long),
+            'change_label': torch.tensor(sample['change_label'], dtype=torch.long),
+            'case_name': sample['case_name']
+        }
+
+
+def build_dataset(is_train, config):
+    """构建数据集"""
+
+    # ===== 配置数据增强 =====
+    transform = AlzheimerTransform(
+        output_size=(config.DATA.IMG_SIZE, config.DATA.IMG_SIZE),
+        is_train=is_train,
+        # 数据增强设置
+        use_rotation=True,  # 保留旋转
+        use_crop=True,  # 保留裁剪
+        print_stats=False  # 不打印统计信息
+    )
+
+    if config.DATA.DATASET == 'alzheimer':
+        # 设置数据目录
+        if is_train:
+            data_dir = os.path.join(config.DATA.DATA_PATH, 'train')
+            if not os.path.exists(data_dir):
+                data_dir = config.DATA.DATA_PATH
+        else:
+            data_dir = os.path.join(config.DATA.DATA_PATH, 'val')
+            if not os.path.exists(data_dir):
+                data_dir = config.DATA.DATA_PATH
+
+        # 如果只有一个目录，则分割数据
+        if data_dir == config.DATA.DATA_PATH:
+            all_files = glob.glob(os.path.join(data_dir, '*.npz'))
+            all_files = [os.path.basename(f) for f in all_files]
+            random.shuffle(all_files)
+
+            split_idx = int(0.8 * len(all_files))
+            if is_train:
+                file_list = all_files[:split_idx]
+            else:
+                file_list = all_files[split_idx:]
+
+            dataset = AlzheimerNPZDataset(
+                data_dir=data_dir,
+                split='train' if is_train else 'val',
+                transform=transform
+            )
+            dataset.files = file_list
+        else:
+            dataset = AlzheimerNPZDataset(
+                data_dir=data_dir,
+                split='train' if is_train else 'val',
+                transform=transform
+            )
+
+        # 设置类别数
+        nb_classes = 3  # 3个类别(1,2,3)
+
+    else:
+        raise NotImplementedError(f"Dataset {config.DATA.DATASET} not supported")
+
+    return dataset, nb_classes
+
+
 def build_loader_finetune(config):
     """构建微调阶段的数据加载器"""
     config.defrost()
-
-    # 设置类别数（根据您的任务调整）
-    # 如果是二分类（AD vs 正常），设为2
-    # 如果是多分类（AD, MCI, 正常等），相应调整
-    config.MODEL.NUM_CLASSES = 2  # 可以根据实际情况调整
-
+    dataset_train, config.MODEL.NUM_CLASSES = build_dataset(is_train=True, config=config)
     config.freeze()
+    dataset_val, _ = build_dataset(is_train=False, config=config)
 
-    # 构建训练和验证数据集
-    transform_train = AlzheimerTransform(
-        output_size=(config.DATA.IMG_SIZE, config.DATA.IMG_SIZE),
-        is_train=True,
-        normalize=True
-    )
+    if dist.is_available() and dist.is_initialized():
+        num_tasks = dist.get_world_size()
+        global_rank = dist.get_rank()
 
-    transform_val = AlzheimerTransform(
-        output_size=(config.DATA.IMG_SIZE, config.DATA.IMG_SIZE),
-        is_train=False,
-        normalize=True
-    )
-
-    # 数据路径设置
-    train_dir = os.path.join(config.DATA.DATA_PATH, 'train')
-    val_dir = os.path.join(config.DATA.DATA_PATH, 'val')
-
-    # 如果没有train/val子目录，则使用同一目录并按比例分割
-    if not os.path.exists(train_dir) or not os.path.exists(val_dir):
-        print("Train/val directories not found, using data split from single directory")
-        all_files = glob.glob(os.path.join(config.DATA.DATA_PATH, '*.npz'))
-
-        # 随机分割数据（80%训练，20%验证）
-        random.shuffle(all_files)
-        split_idx = int(0.8 * len(all_files))
-        train_files = [os.path.basename(f) for f in all_files[:split_idx]]
-        val_files = [os.path.basename(f) for f in all_files[split_idx:]]
-
-        dataset_train = AlzheimerNPZDataset(
-            data_dir=config.DATA.DATA_PATH,
-            split='train',
-            transform=transform_train,
-            file_list=None
+        sampler_train = DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
-        dataset_train.files = train_files
-
-        dataset_val = AlzheimerNPZDataset(
-            data_dir=config.DATA.DATA_PATH,
-            split='val',
-            transform=transform_val,
-            file_list=None
+        sampler_val = DistributedSampler(
+            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
         )
-        dataset_val.files = val_files
     else:
-        # 使用分离的目录
-        dataset_train = AlzheimerNPZDataset(
-            data_dir=train_dir,
-            split='train',
-            transform=transform_train
-        )
+        # 单GPU训练，使用普通采样器
+        sampler_train = None
+        sampler_val = None
 
-        dataset_val = AlzheimerNPZDataset(
-            data_dir=val_dir,
-            split='val',
-            transform=transform_val
-        )
-
-    # 分布式采样器
-    num_tasks = dist.get_world_size()
-    global_rank = dist.get_rank()
-
-    sampler_train = DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
-    sampler_val = DistributedSampler(
-        dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
-    )
-
-    # 数据加载器
     data_loader_train = DataLoader(
         dataset_train,
         sampler=sampler_train,
@@ -232,6 +315,7 @@ def build_loader_finetune(config):
         num_workers=config.DATA.NUM_WORKERS,
         pin_memory=config.DATA.PIN_MEMORY,
         drop_last=True,
+        shuffle=(sampler_train is None),  # 只有在没有sampler时才shuffle
     )
 
     data_loader_val = DataLoader(
@@ -241,9 +325,10 @@ def build_loader_finetune(config):
         num_workers=config.DATA.NUM_WORKERS,
         pin_memory=config.DATA.PIN_MEMORY,
         drop_last=False,
+        shuffle=False,
     )
 
-    # Mixup设置
+    # Mixup设置（对于医学图像可能需要谨慎使用）
     mixup_fn = None
     mixup_active = config.AUG.MIXUP > 0 or config.AUG.CUTMIX > 0. or config.AUG.CUTMIX_MINMAX is not None
     if mixup_active:
@@ -260,14 +345,12 @@ def build_loader_finetune(config):
 
     return dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn
 
-
-# 测试函数
+# ===== 主测试代码 =====
 if __name__ == "__main__":
-    # 测试数据集加载
-    import matplotlib.pyplot as plt
+    """测试数据加载器的完整功能"""
 
-    # 创建一个简单的配置对象用于测试
-    class SimpleConfig:
+    # 测试配置
+    class TestConfig:
         class DATA:
             IMG_SIZE = 256
             DATA_PATH = r"D:\codebase\Swin-Transformer\examples"
@@ -275,44 +358,192 @@ if __name__ == "__main__":
             NUM_WORKERS = 0
             PIN_MEMORY = True
 
-        class AUG:
-            MIXUP = 0
-            CUTMIX = 0
-            CUTMIX_MINMAX = None
-            MIXUP_PROB = 0
-            MIXUP_SWITCH_PROB = 0
-            MIXUP_MODE = 'batch'
+    def visualize_augmentations(dataset, num_samples=4):
+        """可视化数据增强效果"""
+        fig, axes = plt.subplots(2, num_samples, figsize=(num_samples*3, 6))
 
-        class MODEL:
-            LABEL_SMOOTHING = 0.0
-            NUM_CLASSES = 2
+        # 选择一个样本
+        idx = 0
 
-    config = SimpleConfig()
+        # 原始图像（无增强）
+        dataset.transform.is_train = False
+        original_sample = dataset[idx]
 
-    # 测试数据集
-    transform = AlzheimerTransform(output_size=(256, 256), is_train=True)
-    dataset = AlzheimerNPZDataset(
-        data_dir=config.DATA.DATA_PATH,
-        split='test',
-        transform=transform
-    )
+        # 增强图像
+        dataset.transform.is_train = True
 
-    # 加载一个样本
-    if len(dataset) > 0:
-        sample = dataset[0]
-        print(f"Image shape: {sample['image'].shape}")
-        print(f"Label: {sample['label']}")
-        print(f"Change label: {sample['change_label']}")
-        print(f"Case name: {sample['case_name']}")
+        for i in range(num_samples):
+            # 显示原始图像
+            img_orig = original_sample['image'][0].numpy()
+            axes[0, i].imshow(img_orig, cmap='gray')
+            axes[0, i].set_title(f"Original\nRange:[{img_orig.min():.2f}, {img_orig.max():.2f}]")
+            axes[0, i].axis('off')
 
-        # 可视化
-        img = sample['image'].numpy()
-        # 反归一化用于显示
-        img = img * 0.5 + 0.5
-        img = np.transpose(img, (1, 2, 0))
+            # 显示增强后的图像
+            aug_sample = dataset[idx]
+            img_aug = aug_sample['image'][0].numpy()
+            axes[1, i].imshow(img_aug, cmap='gray')
+            axes[1, i].set_title(f"Augmented {i+1}\nRange:[{img_aug.min():.2f}, {img_aug.max():.2f}]")
+            axes[1, i].axis('off')
 
-        plt.figure(figsize=(8, 8))
-        plt.imshow(img[:, :, 0], cmap='gray')
-        plt.title(f"Sample: {sample['case_name']}\nLabel: {sample['label']}, Change: {sample['change_label']}")
-        plt.colorbar()
+        plt.tight_layout()
         plt.show()
+
+    def test_dataloader(data_path=None):
+        """测试数据加载器的主函数"""
+        config = TestConfig()
+
+        # 如果提供了路径，使用提供的路径
+        if data_path:
+            config.DATA.DATA_PATH = data_path
+
+        print("="*60)
+        print("测试阿尔兹海默症NPZ数据加载器（简化版）")
+        print("="*60)
+
+        # 1. 测试基本数据加载
+        print("\n1. 测试基本数据加载...")
+        try:
+            # 创建transform（不做增强）
+            transform = AlzheimerTransform(
+                output_size=(config.DATA.IMG_SIZE, config.DATA.IMG_SIZE),
+                is_train=False,
+                use_crop=False,
+                use_rotation=False,
+                print_stats=True  # 打印数据统计
+            )
+
+            # 创建数据集
+            dataset = AlzheimerNPZDataset(
+                data_dir=config.DATA.DATA_PATH,
+                split='test',
+                transform=transform,
+                debug=True  # 调试模式
+            )
+
+            # 加载第一个样本
+            sample = dataset[0]
+            print(f"\n✓ 成功加载数据")
+            print(f"  - Image shape: {sample['image'].shape}")
+            print(f"  - Image dtype: {sample['image'].dtype}")
+            print(f"  - Label: {sample['label']}")
+            print(f"  - Change label: {sample['change_label']}")
+            print(f"  - Case name: {sample['case_name']}")
+
+        except Exception as e:
+            print(f"✗ 加载数据失败: {e}")
+            return
+
+        # 2. 测试数据增强
+        print("\n2. 测试数据增强（只有裁剪和旋转）...")
+        transform_aug = AlzheimerTransform(
+            output_size=(config.DATA.IMG_SIZE, config.DATA.IMG_SIZE),
+            is_train=True,
+            use_crop=True,      # 启用裁剪
+            use_rotation=True,  # 启用旋转
+            print_stats=False
+        )
+
+        dataset_aug = AlzheimerNPZDataset(
+            data_dir=config.DATA.DATA_PATH,
+            split='train',
+            transform=transform_aug,
+            debug=False
+        )
+
+        # 可视化增强效果
+        print("  显示增强效果...")
+        visualize_augmentations(dataset_aug, num_samples=4)
+
+        # 3. 测试DataLoader
+        print("\n3. 测试DataLoader...")
+        dataloader = DataLoader(
+            dataset_aug,
+            batch_size=config.DATA.BATCH_SIZE,
+            shuffle=True,
+            num_workers=config.DATA.NUM_WORKERS,
+            pin_memory=config.DATA.PIN_MEMORY
+        )
+
+        # 加载一个批次
+        for i, batch in enumerate(dataloader):
+            print(f"✓ 成功加载批次")
+            print(f"  - Batch images shape: {batch['image'].shape}")
+            print(f"  - Batch images dtype: {batch['image'].dtype}")
+
+            # 打印批次数据范围
+            batch_data = batch['image'].numpy()
+            print(f"  - Batch数据范围: [{batch_data.min():.4f}, {batch_data.max():.4f}]")
+            print(f"  - Batch均值: {batch_data.mean():.4f}, 标准差: {batch_data.std():.4f}")
+
+            # 显示批次中的图像
+            actual_batch_size = batch['image'].shape[0]
+            num_show = min(4, actual_batch_size)
+
+            if num_show == 1:
+                # 只有一个图像
+                fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+                img = batch['image'][0, 0].numpy()
+                ax.imshow(img, cmap='gray')
+                ax.set_title(f"Label: {batch['label'][0]}, Change: {batch['change_label'][0]}\n"
+                           f"Range: [{img.min():.2f}, {img.max():.2f}]")
+                ax.axis('off')
+            else:
+                # 多个图像
+                fig, axes = plt.subplots(1, num_show, figsize=(num_show*3, 3))
+                for j in range(num_show):
+                    img = batch['image'][j, 0].numpy()
+                    axes[j].imshow(img, cmap='gray')
+                    axes[j].set_title(f"L:{batch['label'][j]}, C:{batch['change_label'][j]}\n"
+                                    f"[{img.min():.1f}, {img.max():.1f}]")
+                    axes[j].axis('off')
+
+            plt.suptitle("Batch Sample (Z-score Data)")
+            plt.tight_layout()
+            plt.show()
+
+            break  # 只测试一个批次
+
+        # 4. 统计信息
+        print("\n4. 数据集统计信息...")
+        all_labels = []
+        all_change_labels = []
+        all_mins = []
+        all_maxs = []
+
+        # 收集所有标签和数据范围
+        total_samples = len(dataset)
+        print(f"  - 总样本数: {total_samples}")
+
+        for i in range(min(total_samples, 100)):  # 最多检查100个样本
+            sample = dataset[i]
+            all_labels.append(sample['label'].item())
+            all_change_labels.append(sample['change_label'].item())
+
+            # 记录数据范围
+            img_data = sample['image'][0].numpy()
+            all_mins.append(img_data.min())
+            all_maxs.append(img_data.max())
+
+        if all_labels:
+            print(f"\n  - 标签统计:")
+            print(f"    唯一标签值: {np.unique(all_labels)}")
+            print(f"    标签分布: {dict(zip(*np.unique(all_labels, return_counts=True)))}")
+            print(f"    唯一变化标签值: {np.unique(all_change_labels)}")
+            print(f"    变化标签分布: {dict(zip(*np.unique(all_change_labels, return_counts=True)))}")
+
+            print(f"\n  - 数据范围统计:")
+            print(f"    最小值范围: [{np.min(all_mins):.4f}, {np.max(all_mins):.4f}]")
+            print(f"    最大值范围: [{np.min(all_maxs):.4f}, {np.max(all_maxs):.4f}]")
+
+        print("\n测试完成！")
+
+    # 运行测试
+    data_path = r"D:\codebase\Swin-Transformer\examples"
+
+    # 如果路径不存在，尝试当前目录
+    if not os.path.exists(data_path):
+        print(f"路径 {data_path} 不存在，尝试使用当前目录...")
+        data_path = "."
+
+    test_dataloader(data_path)
