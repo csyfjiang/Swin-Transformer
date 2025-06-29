@@ -96,7 +96,7 @@ def read_npz_shapes(npz_path):
 
 def main():
     # 默认文件路径 - 使用原始字符串避免转义问题
-    default_path = r"D:\codebase\Swin-Transformer\examples\002_S_0619_I48617_reg_slice_0.npz"
+    default_path = r"Z:\yufengjiang\data\slice\002_S_0295_I40966_reg_slice_13.npz"
 
     # 如果提供了命令行参数，使用命令行参数
     if len(sys.argv) > 1:

@@ -9,7 +9,7 @@ from .swin_transformer import SwinTransformer
 from .swin_transformer_v2 import SwinTransformerV2
 from .swin_transformer_moe import SwinTransformerMoE
 from .swin_mlp import SwinMLP
-from .swin_transformer_v2_mtad_ptft import SwinTransformerV2_AlzheimerMoE
+from .swin_transformer_v2_mtad_ptft import SwinTransformerV2_AlzheimerMMoE
 from .simmim import build_simmim
 
 
@@ -117,7 +117,7 @@ def build_model(config, is_pretrain=False):
                         patch_norm=config.MODEL.SWIN_MLP.PATCH_NORM,
                         use_checkpoint=config.TRAIN.USE_CHECKPOINT)
     elif model_type == 'swin_admoe':
-        model = SwinTransformerV2_AlzheimerMoE(
+        model = SwinTransformerV2_AlzheimerMMoE(
             img_size=config.DATA.IMG_SIZE,
             patch_size=getattr(config.MODEL.SWIN_ADMOE, 'PATCH_SIZE', 4),
             in_chans=getattr(config.MODEL.SWIN_ADMOE, 'IN_CHANS', 3),
@@ -141,7 +141,23 @@ def build_model(config, is_pretrain=False):
             pretrained_window_sizes=getattr(config.MODEL.SWIN_ADMOE, 'PRETRAINED_WINDOW_SIZES', [0, 0, 0, 0]),
             shift_mlp_ratio=getattr(config.MODEL.SWIN_ADMOE, 'SHIFT_MLP_RATIO', 1.0),
             is_pretrain=getattr(config.MODEL.SWIN_ADMOE, 'IS_PRETRAIN', True),
-            use_shifted_last_layer=getattr(config.MODEL.SWIN_ADMOE, 'USE_SHIFTED_LAST_LAYER', False))
+            use_shifted_last_layer=getattr(config.MODEL.SWIN_ADMOE, 'USE_SHIFTED_LAST_LAYER', False),
+            # ===== 新增MMoE参数 (仅基于原实现) =====
+            num_experts = 4,  # 专家数量，原实现中有
+            temperature_init = 1.0,  # 温度参数，原实现中forward时使用
+            ## ===== 新增Clinical先验参数 =====
+            use_clinical_prior=True,  # 是否使用临床先验信息 (True/False)
+            prior_dim=3,  # 临床先验向量维度 (根据实际数据调整，如3维概率分布)
+            prior_hidden_dim=128,  # MLP编码器的隐藏层维度 (建议: 64/128/256)
+            fusion_stage=2,  # 在哪个stage后融合 (0/1/2/3，推荐1或2，越深语义越丰富)
+            fusion_type='adaptive'  # 融合策略 ('adaptive'/'concat'/'add'/'hadamard')
+            # - 'adaptive': 学习自适应权重（推荐）
+            # - 'concat': 拼接后投影
+            # - 'add': 加权相加
+            # - 'hadamard': 逐元素乘积+残差
+        )
+
+
     else:
         raise NotImplementedError(f"Unknown model: {model_type}")
 

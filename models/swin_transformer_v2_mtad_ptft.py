@@ -1,5 +1,5 @@
 # --------------------------------------------------------
-# Swin Transformer V2 with AlzheimerMoE
+# Swin Transformer V2 with AlzheimerMMoE
 # Copyright (c) 2022 Microsoft
 # Licensed under The MIT License [see LICENSE for details]
 # Written by Ze Liu
@@ -14,181 +14,34 @@ import numpy as np
 import math
 
 
-## Shifted Block Implementation
-def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
-    """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=1, bias=False)
-
-
-class shiftmlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., shift_size=5):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.dim = in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.dwconv = DWConv(hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-        self.shift_size = shift_size
-        self.pad = shift_size // 2
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv2d):
-            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-            fan_out //= m.groups
-            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
-            if m.bias is not None:
-                m.bias.data.zero_()
-
-    def forward(self, x, H, W):
-        B, N, C = x.shape
-
-        xn = x.transpose(1, 2).view(B, C, H, W).contiguous()
-        xn = F.pad(xn, (self.pad, self.pad, self.pad, self.pad), "constant", 0)
-        xs = torch.chunk(xn, self.shift_size, 1)
-        x_shift = [torch.roll(x_c, shift, 2) for x_c, shift in zip(xs, range(-self.pad, self.pad + 1))]
-        x_cat = torch.cat(x_shift, 1)
-        x_cat = torch.narrow(x_cat, 2, self.pad, H)
-        x_s = torch.narrow(x_cat, 3, self.pad, W)
-
-        x_s = x_s.reshape(B, C, H * W).contiguous()
-        x_shift_r = x_s.transpose(1, 2)
-
-        x = self.fc1(x_shift_r)
-
-        x = self.dwconv(x, H, W)
-        x = self.act(x)
-        x = self.drop(x)
-
-        xn = x.transpose(1, 2).view(B, C, H, W).contiguous()
-        xn = F.pad(xn, (self.pad, self.pad, self.pad, self.pad), "constant", 0)
-        xs = torch.chunk(xn, self.shift_size, 1)
-        x_shift = [torch.roll(x_c, shift, 3) for x_c, shift in zip(xs, range(-self.pad, self.pad + 1))]
-        x_cat = torch.cat(x_shift, 1)
-        x_cat = torch.narrow(x_cat, 2, self.pad, H)
-        x_s = torch.narrow(x_cat, 3, self.pad, W)
-        x_s = x_s.reshape(B, C, H * W).contiguous()
-        x_shift_c = x_s.transpose(1, 2)
-
-        x = self.fc2(x_shift_c)
-        x = self.drop(x)
-        return x
-
-
-class shiftedBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, sr_ratio=1, input_resolution=(1, 1)):
-        super().__init__()
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.H, self.W = input_resolution
-        self.mlp = shiftmlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv2d):
-            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-            fan_out //= m.groups
-            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
-            if m.bias is not None:
-                m.bias.data.zero_()
-
-    def forward(self, x):
-        x = x + self.drop_path(self.mlp(self.norm2(x), self.H, self.W))
-        return x
-
-    def flops(self):
-        flops = 5 * 256 * 768
-        return flops
-
-
-class DWConv(nn.Module):
-    def __init__(self, dim=768):
-        super(DWConv, self).__init__()
-        self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
-
-    def forward(self, x, H, W):
-        B, N, C = x.shape
-        x = x.transpose(1, 2).view(B, C, H, W)
-        x = self.dwconv(x)
-        x = x.flatten(2).transpose(1, 2)
-        return x
-
-
-## MoE Logic Implementation - Corrected
-class ExpertMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers=1, activation=nn.GELU()):
-        super(ExpertMLP, self).__init__()
-        layers = []
-        output_dim = input_dim
-        for _ in range(num_layers):
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(activation)
-            input_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, output_dim))
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.mlp(x)
-
-
-class FeatureLevelAttention(nn.Module):
+def window_partition(x, window_size):
     """
-    Feature-level attention mechanism for gating network
-    计算特征重要性权重，实现自适应特征选择
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
     """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
 
-    def __init__(self, dim, num_experts=4):
-        super(FeatureLevelAttention, self).__init__()
-        self.dim = dim
 
-        # Feature transformation network
-        self.linear1 = nn.Linear(self.dim, int(self.dim * 0.5))
-
-        # Feature importance attention mechanism
-        self.feature_attention = nn.Linear(int(self.dim * 0.5), int(self.dim * 0.5))
-
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(p=0.1)
-        self.linear2 = nn.Linear(int(self.dim * 0.5), num_experts)
-
-    def forward(self, x):
-        # Feature transformation
-        x = self.linear1(x)
-        x = self.relu(x)
-
-        # Compute feature importance scores
-        attention_scores = self.feature_attention(x)
-        attention_weights = F.softmax(attention_scores, dim=-1)
-
-        # Apply feature-level attention (element-wise multiplication)
-        x = x * attention_weights
-
-        x = self.dropout(x)
-        x = self.linear2(x)
-
-        return x
+def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
 
 
 class Mlp(nn.Module):
@@ -210,102 +63,166 @@ class Mlp(nn.Module):
         return x
 
 
-class AlzheimerMoE(nn.Module):
+class FeatureLevelAttention(nn.Module):
+    """Feature-level attention mechanism for gating network"""
+
+    def __init__(self, dim, num_experts=4):
+        super().__init__()
+        self.dim = dim
+
+        # Feature transformation network
+        self.linear1 = nn.Linear(self.dim, int(self.dim * 0.5))
+        self.feature_attention = nn.Linear(int(self.dim * 0.5), int(self.dim * 0.5))
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=0.1)
+        self.linear2 = nn.Linear(int(self.dim * 0.5), num_experts)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.relu(x)
+
+        attention_scores = self.feature_attention(x)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        x = x * attention_weights
+
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return x
+
+
+class AlzheimerMMoE(nn.Module):
+    """Multi-gate Mixture of Experts for Alzheimer Disease Analysis"""
+
     def __init__(self, dim, hidden_dim, num_experts=4, act_layer=nn.GELU, drop=0.):
         super().__init__()
         self.dim = dim
         self.num_experts = num_experts
 
-        # 4个专家：shared, AD, MCI, CN - 使用Mlp实现
+        # 4个共享专家：shared, AD-focused, MCI-focused, CN-focused
         self.experts = nn.ModuleList([
             Mlp(in_features=dim, hidden_features=hidden_dim, out_features=dim, act_layer=act_layer, drop=drop)
             for _ in range(num_experts)
         ])
 
-        # 微调阶段的门控网络 - 使用FeatureLevelAttention实现
-        self.gating_network = FeatureLevelAttention(dim, num_experts)
+        # 诊断任务的门控网络
+        self.diagnosis_gate = FeatureLevelAttention(dim, num_experts)
+        # 变化任务的门控网络
+        self.change_gate = FeatureLevelAttention(dim, num_experts)
 
-    def forward(self, x, lbls=None, is_pretrain=True, temperature=1.0):
-        if is_pretrain and lbls is not None:
-            # 预训练阶段：先验指定路由
-            weights = torch.zeros(x.size(0), x.size(1), self.num_experts, device=x.device)
+        # 任务特定的特征变换层
+        self.diagnosis_transform = nn.Linear(dim, dim)
+        self.change_transform = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(drop)
 
-            # 共享专家始终激活
-            weights[:, :, 0] = 0.5  # shared expert权重
+    def forward(self, x, lbls_diagnosis=None, lbls_change=None, is_pretrain=True, temperature=1.0):
+        """
+        Args:
+            x: 输入特征 [B, L, dim]
+            lbls_diagnosis: 诊断标签 [B] (0: CN, 1: MCI, 2: AD)
+            lbls_change: 变化标签 [B] (0: Stable, 1: Conversion, 2: Reversion)
+            is_pretrain: 是否为预训练阶段
+            temperature: softmax温度参数
+        Returns:
+            tuple: (diagnosis_output, change_output)
+        """
+        batch_size, seq_len, feature_dim = x.shape
 
-            # 根据标签激活对应专家
-            for i, lbl in enumerate(lbls):
-                if lbl == 2:  # Dementia (标签3转为0-indexed后是2)
-                    weights[i, :, 1] = 0.5
-                elif lbl == 1:  # MCI (标签2转为0-indexed后是1)
-                    weights[i, :, 2] = 0.5
-                elif lbl == 0:  # CN (标签1转为0-indexed后是0)
-                    weights[i, :, 3] = 0.5
-        else:
-            # 微调阶段：使用FeatureLevelAttention学习性路由
-            gate_logits = self.gating_network(x)  # [B, L, num_experts]
-            weights = F.softmax(gate_logits / temperature, dim=-1)
-
-        # 专家输出加权组合
+        # 计算所有专家的输出
         expert_outputs = []
-        for i, expert in enumerate(self.experts):
-            output = expert(x)  # [B, L, dim]
-            weight = weights[:, :, i:i + 1]  # [B, L, 1]
-            expert_outputs.append(output * weight)
+        for expert in self.experts:
+            expert_output = expert(x)  # [B, L, dim]
+            expert_outputs.append(expert_output)
+        expert_outputs = torch.stack(expert_outputs, dim=-1)  # [B, L, dim, num_experts]
 
-        return sum(expert_outputs)
+        # === 诊断任务路由 ===
+        if is_pretrain and lbls_diagnosis is not None:
+            # 预训练阶段：基于诊断标签的先验路由
+            diagnosis_weights = torch.zeros(batch_size, seq_len, self.num_experts, device=x.device)
+            diagnosis_weights[:, :, 0] = 0.4  # shared expert权重
 
+            # 根据诊断标签激活对应专家
+            for i, lbl in enumerate(lbls_diagnosis):
+                if lbl == 2:  # AD
+                    diagnosis_weights[i, :, 1] = 0.6
+                elif lbl == 1:  # MCI
+                    diagnosis_weights[i, :, 2] = 0.6
+                elif lbl == 0:  # CN
+                    diagnosis_weights[i, :, 3] = 0.6
+        else:
+            # 微调阶段：使用学习的门控网络
+            diagnosis_transformed_x = self.diagnosis_transform(x)
+            diagnosis_gate_logits = self.diagnosis_gate(diagnosis_transformed_x)
+            diagnosis_weights = F.softmax(diagnosis_gate_logits / temperature, dim=-1)
 
-## Swin Transformer v2 implementation
-def window_partition(x, window_size):
-    """
-    Args:
-        x: (B, H, W, C)
-        window_size (int): window size
+        # === 变化任务路由 ===
+        if is_pretrain and lbls_change is not None:
+            # 预训练阶段：基于变化标签的先验路由
+            change_weights = torch.zeros(batch_size, seq_len, self.num_experts, device=x.device)
+            change_weights[:, :, 0] = 0.4  # shared expert权重
 
-    Returns:
-        windows: (num_windows*B, window_size, window_size, C)
-    """
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    return windows
+            # 根据变化标签激活对应专家
+            for i, lbl in enumerate(lbls_change):
+                if lbl == 2:  # Reversion (认知改善)
+                    change_weights[i, :, 3] = 0.6  # 倾向于使用CN专家
+                elif lbl == 1:  # Conversion (认知恶化)
+                    change_weights[i, :, 1] = 0.6  # 倾向于使用AD专家
+                elif lbl == 0:  # Stable (稳定)
+                    # 根据当前诊断状态决定
+                    if lbls_diagnosis is not None:
+                        if lbls_diagnosis[i] == 2:  # 当前AD，稳定
+                            change_weights[i, :, 1] = 0.6
+                        elif lbls_diagnosis[i] == 1:  # 当前MCI，稳定
+                            change_weights[i, :, 2] = 0.6
+                        elif lbls_diagnosis[i] == 0:  # 当前CN，稳定
+                            change_weights[i, :, 3] = 0.6
+                    else:
+                        # 如果没有诊断标签，平均分配给所有专家
+                        change_weights[i, :, 1:] = 0.2
+        else:
+            # 微调阶段：使用学习的门控网络
+            change_transformed_x = self.change_transform(x)
+            change_gate_logits = self.change_gate(change_transformed_x)
+            change_weights = F.softmax(change_gate_logits / temperature, dim=-1)
 
+        # 计算任务特定的专家输出加权组合
+        # 诊断任务输出
+        diagnosis_weights_expanded = diagnosis_weights.unsqueeze(2)  # [B, L, 1, num_experts]
+        diagnosis_output = torch.sum(expert_outputs * diagnosis_weights_expanded, dim=-1)  # [B, L, dim]
 
-def window_reverse(windows, window_size, H, W):
-    """
-    Args:
-        windows: (num_windows*B, window_size, window_size, C)
-        window_size (int): Window size
-        H (int): Height of image
-        W (int): Width of image
+        # 变化任务输出
+        change_weights_expanded = change_weights.unsqueeze(2)  # [B, L, 1, num_experts]
+        change_output = torch.sum(expert_outputs * change_weights_expanded, dim=-1)  # [B, L, dim]
 
-    Returns:
-        x: (B, H, W, C)
-    """
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    return x
+        # 应用dropout
+        diagnosis_output = self.dropout(diagnosis_output)
+        change_output = self.dropout(change_output)
+
+        return diagnosis_output, change_output
+
+    def get_gate_weights(self, x, temperature=1.0):
+        """获取两个门控网络的权重分布（用于分析和可视化）"""
+        diagnosis_transformed_x = self.diagnosis_transform(x)
+        change_transformed_x = self.change_transform(x)
+
+        diagnosis_gate_logits = self.diagnosis_gate(diagnosis_transformed_x)
+        change_gate_logits = self.change_gate(change_transformed_x)
+
+        diagnosis_weights = F.softmax(diagnosis_gate_logits / temperature, dim=-1)
+        change_weights = F.softmax(change_gate_logits / temperature, dim=-1)
+
+        return {
+            'diagnosis_weights': diagnosis_weights,
+            'change_weights': change_weights,
+            'diagnosis_logits': diagnosis_gate_logits,
+            'change_logits': change_gate_logits
+        }
 
 
 class WindowAttention(nn.Module):
-    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
-
-    Args:
-        dim (int): Number of input channels.
-        window_size (tuple[int]): The height and width of the window.
-        num_heads (int): Number of attention heads.
-        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
-        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
-        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
-        pretrained_window_size (tuple[int]): The height and width of the window in pre-training.
-    """
+    """Window based multi-head self attention (W-MSA) module with relative position bias."""
 
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.,
                  pretrained_window_size=[0, 0]):
-
         super().__init__()
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
@@ -364,22 +281,18 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
         B_, N, C = x.shape
         qkv_bias = None
         if self.q_bias is not None:
             qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
         qkv = qkv.reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy
 
         # cosine attention
         attn = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1))
-        logit_scale = torch.clamp(self.logit_scale, max=torch.log(torch.tensor(1. / 0.01, device=self.logit_scale.device))).exp()
+        logit_scale = torch.clamp(self.logit_scale,
+                                  max=torch.log(torch.tensor(1. / 0.01, device=self.logit_scale.device))).exp()
         attn = attn * logit_scale
 
         relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
@@ -404,10 +317,6 @@ class WindowAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, ' \
-               f'pretrained_window_size={self.pretrained_window_size}, num_heads={self.num_heads}'
-
     def flops(self, N):
         # calculate flops for 1 window with token length of N
         flops = 0
@@ -422,152 +331,8 @@ class WindowAttention(nn.Module):
         return flops
 
 
-class SwinTransformerBlock(nn.Module):
-    r""" Swin Transformer Block.
-
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
-        num_heads (int): Number of attention heads.
-        window_size (int): Window size.
-        shift_size (int): Shift size for SW-MSA.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        attn_drop (float, optional): Attention dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-        pretrained_window_size (int): Window size in pre-training.
-    """
-
-    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
-                 mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, pretrained_window_size=0):
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
-
-        self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
-            pretrained_window_size=to_2tuple(pretrained_window_size))
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-        if self.shift_size > 0:
-            # calculate attention mask for SW-MSA
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-
-            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-        else:
-            attn_mask = None
-
-        self.register_buffer("attn_mask", attn_mask)
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-
-        shortcut = x
-        x = x.view(B, H, W, C)
-
-        # cyclic shift
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_x = x
-
-        # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
-
-        # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
-
-        # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
-
-        # reverse cyclic shift
-        if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x = shifted_x
-        x = x.view(B, H * W, C)
-        x = shortcut + self.drop_path(self.norm1(x))
-
-        # FFN
-        x = x + self.drop_path(self.norm2(self.mlp(x)))
-
-        return x
-
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-
-    def flops(self):
-        flops = 0
-        H, W = self.input_resolution
-        # norm1
-        flops += self.dim * H * W
-        # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
-        return flops
-
-
-class SwinTransformerBlock_ADMoE(nn.Module):
-    r""" Swin Transformer Block with Alzheimer MoE.
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        num_heads (int): Number of attention heads.
-        window_size (int): Window size.
-        shift_size (int): Shift size for SW-MSA.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        attn_drop (float, optional): Attention dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        pretrained_window_size (int): Local window size in pre-training.
-        is_pretrain (bool): Whether in pretraining stage. Default: True
-    """
+class SwinTransformerBlock_ADMMoE(nn.Module):
+    """Swin Transformer Block with Alzheimer Multi-gate MoE."""
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
@@ -582,7 +347,6 @@ class SwinTransformerBlock_ADMoE(nn.Module):
         self.is_pretrain = is_pretrain
 
         if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
@@ -594,11 +358,12 @@ class SwinTransformerBlock_ADMoE(nn.Module):
             pretrained_window_size=to_2tuple(pretrained_window_size))
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
+        self.norm2_diagnosis = norm_layer(dim)  # 诊断任务的norm
+        self.norm2_change = norm_layer(dim)  # 变化任务的norm
 
-        # 使用AlzheimerMoE替换标准MLP
+        # 使用AlzheimerMMoE替换标准MLP
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = AlzheimerMoE(
+        self.mmoe = AlzheimerMMoE(
             dim=dim,
             hidden_dim=mlp_hidden_dim,
             num_experts=4,
@@ -606,8 +371,8 @@ class SwinTransformerBlock_ADMoE(nn.Module):
             drop=drop
         )
 
+        # 计算attention mask
         if self.shift_size > 0:
-            # calculate attention mask for SW-MSA
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
             h_slices = (slice(0, -self.window_size),
@@ -631,7 +396,7 @@ class SwinTransformerBlock_ADMoE(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, x, lbls=None):
+    def forward(self, x, lbls_diagnosis=None, lbls_change=None):
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -664,22 +429,28 @@ class SwinTransformerBlock_ADMoE(nn.Module):
             x = shifted_x
         x = x.view(B, H * W, C)
 
-        # FFN
+        # FFN with MMoE
         x = shortcut + self.drop_path(x)
 
-        # AlzheimerMoE
-        x = x + self.drop_path(self.mlp(
-            self.norm2(x),
-            lbls=lbls,
+        # 分别对两个任务应用norm
+        x_diagnosis_norm = self.norm2_diagnosis(x)
+        x_change_norm = self.norm2_change(x)
+
+        # 使用平均norm结果作为MMoE输入
+        mmoe_input = (x_diagnosis_norm + x_change_norm) / 2
+        diagnosis_output, change_output = self.mmoe(
+            mmoe_input,
+            lbls_diagnosis=lbls_diagnosis,
+            lbls_change=lbls_change,
             is_pretrain=self.is_pretrain,
             temperature=1.0
-        ))
+        )
 
-        return x
+        # 应用drop_path
+        x_diagnosis = x + self.drop_path(diagnosis_output)
+        x_change = x + self.drop_path(change_output)
 
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
+        return x_diagnosis, x_change
 
     def flops(self):
         flops = 0
@@ -689,21 +460,15 @@ class SwinTransformerBlock_ADMoE(nn.Module):
         # W-MSA/SW-MSA
         nW = H * W / self.window_size / self.window_size
         flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp (估算，实际需要考虑MoE的复杂度)
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
+        # mmoe (估算，实际需要考虑MMoE的复杂度)
+        flops += 4 * H * W * self.dim * self.dim * self.mlp_ratio  # 双任务的计算量
+        # norm2 (两个任务)
+        flops += 2 * self.dim * H * W
         return flops
 
 
 class PatchMerging(nn.Module):
-    r""" Patch Merging Layer.
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
+    """Patch Merging Layer."""
 
     def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -713,9 +478,6 @@ class PatchMerging(nn.Module):
         self.norm = norm_layer(2 * dim)
 
     def forward(self, x):
-        """
-        x: B, H*W, C
-        """
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -732,11 +494,7 @@ class PatchMerging(nn.Module):
 
         x = self.reduction(x)
         x = self.norm(x)
-
         return x
-
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
 
     def flops(self):
         H, W = self.input_resolution
@@ -745,32 +503,13 @@ class PatchMerging(nn.Module):
         return flops
 
 
-class BasicLayer(nn.Module):
-    """ A basic Swin Transformer layer for one stage with Alzheimer MoE.
-
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        depth (int): Number of blocks.
-        num_heads (int): Number of attention heads.
-        window_size (int): Local window size.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        attn_drop (float, optional): Attention dropout rate. Default: 0.0
-        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
-        pretrained_window_size (int): Local window size in pre-training.
-        is_pretrain (bool): Whether in pretraining stage. Default: True
-    """
+class BasicLayerMMoE(nn.Module):
+    """A basic Swin Transformer layer for one stage with Alzheimer MMoE."""
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
                  pretrained_window_size=0, is_pretrain=True):
-
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -778,9 +517,9 @@ class BasicLayer(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.is_pretrain = is_pretrain
 
-        # build blocks with AlzheimerMoE
+        # build blocks with AlzheimerMMoE
         self.blocks = nn.ModuleList([
-            SwinTransformerBlock_ADMoE(
+            SwinTransformerBlock_ADMMoE(
                 dim=dim,
                 input_resolution=input_resolution,
                 num_heads=num_heads,
@@ -802,18 +541,27 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, lbls=None):
+    def forward(self, x, lbls_diagnosis=None, lbls_change=None):
+        # 需要追踪两个任务的特征
+        x_diagnosis, x_change = x, x
+
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, lbls)
+                x_diagnosis, x_change = checkpoint.checkpoint(blk, x_diagnosis, lbls_diagnosis, lbls_change)
             else:
-                x = blk(x, lbls)
-        if self.downsample is not None:
-            x = self.downsample(x)
-        return x
+                x_diagnosis, x_change = blk(x_diagnosis, lbls_diagnosis, lbls_change)
 
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
+        if self.downsample is not None:
+            x_diagnosis = self.downsample(x_diagnosis)
+            x_change = self.downsample(x_change)
+
+        return x_diagnosis, x_change
+
+    def set_pretrain_mode(self, is_pretrain):
+        """设置预训练模式"""
+        self.is_pretrain = is_pretrain
+        for blk in self.blocks:
+            blk.is_pretrain = is_pretrain
 
     def flops(self):
         flops = 0
@@ -823,30 +571,9 @@ class BasicLayer(nn.Module):
             flops += self.downsample.flops()
         return flops
 
-    def _init_respostnorm(self):
-        for blk in self.blocks:
-            nn.init.constant_(blk.norm1.bias, 0)
-            nn.init.constant_(blk.norm1.weight, 0)
-            nn.init.constant_(blk.norm2.bias, 0)
-            nn.init.constant_(blk.norm2.weight, 0)
-
-    def set_pretrain_mode(self, is_pretrain):
-        """设置预训练模式"""
-        self.is_pretrain = is_pretrain
-        for blk in self.blocks:
-            blk.is_pretrain = is_pretrain
-
 
 class PatchEmbed(nn.Module):
-    r""" Image to Patch Embedding
-
-    Args:
-        img_size (int): Image size.  Default: 224.
-        patch_size (int): Patch token size. Default: 4.
-        in_chans (int): Number of input image channels. Default: 3.
-        embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
-    """
+    """Image to Patch Embedding"""
 
     def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
@@ -869,7 +596,6 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
@@ -885,52 +611,184 @@ class PatchEmbed(nn.Module):
         return flops
 
 
-class SwinTransformerV2_AlzheimerMoE(nn.Module):
-    r""" Swin Transformer V2 with Alzheimer MoE for Dual-Task Classification
-        Modified to support two classification heads:
-        - Diagnosis: CN (1), MCI (2), Dementia (3)
-        - Change: Stable (1), Conversion (2), Reversion (3)
-
-    Args:
-        img_size (int | tuple(int)): Input image size. Default 224
-        patch_size (int | tuple(int)): Patch size. Default: 4
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for both tasks. Default: 3
-        num_classes_diagnosis (int): Number of classes for diagnosis task. Default: 3
-        num_classes_change (int): Number of classes for change task. Default: 3
-        embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each Swin Transformer layer.
-        num_heads (tuple(int)): Number of attention heads in different layers.
-        window_size (int): Window size. Default: 7
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
-        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
-        drop_rate (float): Dropout rate. Default: 0
-        attn_drop_rate (float): Attention dropout rate. Default: 0
-        drop_path_rate (float): Stochastic depth rate. Default: 0.1
-        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
-        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
-        patch_norm (bool): If True, add normalization after patch embedding. Default: True
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
-        pretrained_window_sizes (tuple(int)): Pretrained window sizes of each layer.
-        is_pretrain (bool): Whether in pretraining stage. Default: True
-        use_shifted_last_layer (bool): Whether to use shiftedBlock in the last layer. Default: False
+class ClinicalPriorEncoder(nn.Module):
+    """
+    临床先验编码器
+    将3维的prior向量编码到与图像特征相同的维度
     """
 
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=3,
+    def __init__(self, prior_dim=3, hidden_dim=128, output_dim=384, dropout=0.1):
+        """
+        Args:
+            prior_dim: 输入prior向量维度 (默认3)
+            hidden_dim: MLP隐藏层维度
+            output_dim: 输出维度，需要与Stage 2的特征维度匹配
+            dropout: dropout率
+        """
+        super().__init__()
+
+        # 简单的3层MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(prior_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim * 2, output_dim),
+            nn.LayerNorm(output_dim)
+        )
+
+        # 初始化权重
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, prior):
+        """
+        Args:
+            prior: [B, 3] 临床先验向量
+        Returns:
+            encoded_prior: [B, output_dim] 编码后的特征
+        """
+        return self.mlp(prior)
+
+
+class ClinicalImageFusion(nn.Module):
+    """
+    临床特征与图像特征融合模块
+    支持多种融合策略
+    """
+
+    def __init__(self, image_dim, clinical_dim, fusion_type='adaptive', dropout=0.1):
+        """
+        Args:
+            image_dim: 图像特征维度
+            clinical_dim: 临床特征维度（应该与image_dim相同）
+            fusion_type: 融合类型 ('adaptive', 'concat', 'add', 'hadamard')
+            dropout: dropout率
+        """
+        super().__init__()
+
+        assert clinical_dim == image_dim, "Clinical and image dimensions must match"
+
+        self.fusion_type = fusion_type
+        self.image_dim = image_dim
+
+        if fusion_type == 'adaptive':
+            # 自适应融合：学习融合权重
+            self.gate = nn.Sequential(
+                nn.Linear(image_dim * 2, image_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(image_dim, 2),
+                nn.Softmax(dim=1)
+            )
+            self.fusion_proj = nn.Linear(image_dim, image_dim)
+
+        elif fusion_type == 'concat':
+            # 拼接后投影回原维度
+            self.fusion_proj = nn.Sequential(
+                nn.Linear(image_dim * 2, image_dim),
+                nn.LayerNorm(image_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout)
+            )
+
+        elif fusion_type == 'add':
+            # 简单相加，带可学习的缩放因子
+            self.clinical_scale = nn.Parameter(torch.ones(1))
+            self.image_scale = nn.Parameter(torch.ones(1))
+
+        elif fusion_type == 'hadamard':
+            # Hadamard积（逐元素乘积）+ 残差连接
+            self.fusion_proj = nn.Linear(image_dim, image_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, image_features, clinical_features):
+        """
+        Args:
+            image_features: [B, L, C] 图像特征 (L = H*W)
+            clinical_features: [B, C] 临床特征（已经通过encoder编码到C维）
+        Returns:
+            fused_features: [B, L, C] 融合后的特征
+        """
+        B, L, C = image_features.shape
+
+        # 将临床特征扩展到与图像特征相同的空间维度
+        # clinical_features: [B, C] -> [B, 1, C] -> [B, L, C]
+        clinical_features_expanded = clinical_features.unsqueeze(1).expand(B, L, C)
+
+        if self.fusion_type == 'adaptive':
+            # 计算自适应融合权重
+            combined = torch.cat([image_features, clinical_features_expanded], dim=-1)
+            weights = self.gate(combined.mean(dim=1))  # [B, 2]
+
+            # 应用权重
+            image_weight = weights[:, 0:1].unsqueeze(1)  # [B, 1, 1]
+            clinical_weight = weights[:, 1:2].unsqueeze(1)  # [B, 1, 1]
+
+            fused = image_weight * image_features + clinical_weight * clinical_features_expanded
+            fused = self.fusion_proj(fused)
+
+        elif self.fusion_type == 'concat':
+            # 拼接并投影
+            combined = torch.cat([image_features, clinical_features_expanded], dim=-1)
+            fused = self.fusion_proj(combined)
+
+        elif self.fusion_type == 'add':
+            # 加权相加
+            fused = self.image_scale * image_features + self.clinical_scale * clinical_features_expanded
+
+        elif self.fusion_type == 'hadamard':
+            # Hadamard积 + 残差
+            product = image_features * clinical_features_expanded
+            fused = image_features + self.fusion_proj(product)
+
+        return self.dropout(fused)
+
+
+# ===== 修改SwinTransformerV2_AlzheimerMMoE以集成临床先验 =====
+class SwinTransformerV2_AlzheimerMMoE(nn.Module):
+    """
+    扩展版Swin Transformer V2 with Alzheimer MMoE
+    集成临床先验信息
+    """
+
+    def __init__(self,
+                 # 原有参数
+                 img_size=224, patch_size=4, in_chans=3,
                  num_classes_diagnosis=3, num_classes_change=3,
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, pretrained_window_sizes=[0, 0, 0, 0], shift_mlp_ratio=1.0,
-                 is_pretrain=True, use_shifted_last_layer=False, **kwargs):
+                 use_checkpoint=False, pretrained_window_sizes=[0, 0, 0, 0],
+                 is_pretrain=True,
+                 # 新增参数
+                 use_clinical_prior=True,
+                 prior_dim=3,
+                 prior_hidden_dim=128,
+                 fusion_stage=2,  # 在哪个stage后融合
+                 fusion_type='adaptive',
+                 **kwargs):
+
         super().__init__()
 
-        # 双任务的类别数
-        self.num_classes = num_classes  # 保留兼容性
+        # ===== 保存所有原有初始化代码 =====
         self.num_classes_diagnosis = num_classes_diagnosis
         self.num_classes_change = num_classes_change
-
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.ape = ape
@@ -938,10 +796,12 @@ class SwinTransformerV2_AlzheimerMoE(nn.Module):
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.mlp_ratio = mlp_ratio
         self.is_pretrain = is_pretrain
-        self.use_shifted_last_layer = use_shifted_last_layer
-        self.shift_mlp_ratio = shift_mlp_ratio
 
-        # split image into non-overlapping patches
+        # 临床先验相关参数
+        self.use_clinical_prior = use_clinical_prior
+        self.fusion_stage = fusion_stage
+
+        # Patch embedding
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None)
@@ -949,74 +809,75 @@ class SwinTransformerV2_AlzheimerMoE(nn.Module):
         patches_resolution = self.patch_embed.patches_resolution
         self.patches_resolution = patches_resolution
 
-        # absolute position embedding
+        # Absolute position embedding
         if self.ape:
             self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
             trunc_normal_(self.absolute_pos_embed, std=.02)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        # stochastic depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        # Stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
-        # build layers
+        # ===== 临床先验编码器 =====
+        if self.use_clinical_prior:
+            # 计算融合stage的特征维度
+            # 注意：如果在stage i后融合，实际维度是 embed_dim * 2^(i+1)
+            # 因为PatchMerging会使维度翻倍
+            if fusion_stage < self.num_layers - 1:
+                # 如果不是最后一个stage，需要考虑PatchMerging的维度翻倍
+                fusion_dim = int(embed_dim * 2 ** (fusion_stage + 1))
+            else:
+                # 最后一个stage没有PatchMerging
+                fusion_dim = int(embed_dim * 2 ** fusion_stage)
+
+            # 临床先验编码器
+            self.clinical_encoder = ClinicalPriorEncoder(
+                prior_dim=prior_dim,
+                hidden_dim=prior_hidden_dim,
+                output_dim=fusion_dim,
+                dropout=drop_rate
+            )
+
+            # 融合模块
+            self.clinical_fusion = ClinicalImageFusion(
+                image_dim=fusion_dim,
+                clinical_dim=fusion_dim,
+                fusion_type=fusion_type,
+                dropout=drop_rate
+            )
+
+        # Build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            if i_layer < self.num_layers - 1 or not self.use_shifted_last_layer:
-                # Use BasicLayer with AlzheimerMoE for all layers (or all but last)
-                layer = BasicLayer(
-                    dim=int(embed_dim * 2 ** i_layer),
-                    input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                                      patches_resolution[1] // (2 ** i_layer)),
-                    depth=depths[i_layer],
-                    num_heads=num_heads[i_layer],
-                    window_size=window_size,
-                    mlp_ratio=self.mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    drop=drop_rate,
-                    attn_drop=attn_drop_rate,
-                    drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                    norm_layer=norm_layer,
-                    downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                    use_checkpoint=use_checkpoint,
-                    pretrained_window_size=pretrained_window_sizes[i_layer],
-                    is_pretrain=is_pretrain)
-            else:
-                # Use shiftedBlock for the last layer (if enabled)
-                layer = shiftedBlock(
-                    dim=int(embed_dim * 2 ** i_layer),
-                    num_heads=num_heads[i_layer],
-                    mlp_ratio=self.shift_mlp_ratio,  # shift_mlp_ratio
-                    qkv_bias=qkv_bias,
-                    qk_scale=None,
-                    drop=drop_rate,
-                    attn_drop=attn_drop_rate,
-                    drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])][0],
-                    norm_layer=norm_layer,
-                    sr_ratio=8,
-                    input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                                      patches_resolution[1] // (2 ** i_layer))
-                )
+            layer = BasicLayerMMoE(
+                dim=int(embed_dim * 2 ** i_layer),
+                input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                  patches_resolution[1] // (2 ** i_layer)),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=window_size,
+                mlp_ratio=self.mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                use_checkpoint=use_checkpoint,
+                pretrained_window_size=pretrained_window_sizes[i_layer],
+                is_pretrain=is_pretrain)
             self.layers.append(layer)
 
-        self.norm = norm_layer(self.num_features)
+        # Task-specific norms and heads
+        self.norm_diagnosis = norm_layer(self.num_features)
+        self.norm_change = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
 
-        # ===== 双任务分类头 =====
-        # 诊断任务头 (CN, MCI, Dementia)
         self.head_diagnosis = nn.Linear(self.num_features, num_classes_diagnosis)
-
-        # 变化任务头 (Stable, Conversion, Reversion)
         self.head_change = nn.Linear(self.num_features, num_classes_change)
 
-        # 为了兼容性，保留原始head（可选）
-        self.head = None
-
         self.apply(self._init_weights)
-        for i, bly in enumerate(self.layers):
-            # 只对BasicLayer应用_init_respostnorm
-            if hasattr(bly, '_init_respostnorm'):
-                bly._init_respostnorm()
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -1027,61 +888,105 @@ class SwinTransformerV2_AlzheimerMoE(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def set_pretrain_mode(self, is_pretrain):
-        """设置预训练/微调模式"""
-        self.is_pretrain = is_pretrain
-        for layer in self.layers:
-            if hasattr(layer, 'set_pretrain_mode'):
-                layer.set_pretrain_mode(is_pretrain)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'absolute_pos_embed'}
-
-    @torch.jit.ignore
-    def no_weight_decay_keywords(self):
-        return {"cpb_mlp", "logit_scale", 'relative_position_bias_table'}
-
-    def forward_features(self, x, lbls=None):
+    def forward_features(self, x, clinical_prior=None, lbls_diagnosis=None, lbls_change=None):
+        """
+        Args:
+            x: 图像输入
+            clinical_prior: [B, 3] 临床先验向量
+            lbls_diagnosis: 诊断标签
+            lbls_change: 变化标签
+        """
+        # Patch embedding
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
-        for layer in self.layers:
-            # 检查layer类型，决定是否传递lbls参数
-            if hasattr(layer, 'set_pretrain_mode'):  # BasicLayer
-                x = layer(x, lbls)
-            else:  # shiftedBlock
-                x = layer(x)
+        # 编码临床先验
+        if self.use_clinical_prior and clinical_prior is not None:
+            clinical_features = self.clinical_encoder(clinical_prior)
+        else:
+            clinical_features = None
 
-        x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
-        x = torch.flatten(x, 1)
-        return x
+        # 通过各层
+        x_diagnosis, x_change = x, x
 
-    def forward(self, x, lbls=None, return_features=False):
+        for i_layer, layer in enumerate(self.layers):
+            # 通过当前层
+            x_diagnosis, x_change = layer(x_diagnosis, lbls_diagnosis, lbls_change)
+
+            # 在指定stage后融合临床特征
+            if self.use_clinical_prior and clinical_features is not None and i_layer == self.fusion_stage:
+                # 对两个任务分支都进行融合
+                x_diagnosis = self.clinical_fusion(x_diagnosis, clinical_features)
+                x_change = self.clinical_fusion(x_change, clinical_features)
+
+        # Final normalization and pooling
+        x_diagnosis = self.norm_diagnosis(x_diagnosis)
+        x_change = self.norm_change(x_change)
+
+        x_diagnosis = self.avgpool(x_diagnosis.transpose(1, 2))
+        x_change = self.avgpool(x_change.transpose(1, 2))
+
+        x_diagnosis = torch.flatten(x_diagnosis, 1)
+        x_change = torch.flatten(x_change, 1)
+
+        return x_diagnosis, x_change
+
+    def forward(self, x, clinical_prior=None, lbls_diagnosis=None, lbls_change=None, return_features=False):
         """
         前向传播
         Args:
             x: 输入图像
-            lbls: 标签（用于MoE路由）
-            return_features: 是否返回特征（用于特征分析）
-        Returns:
-            Tuple[Tensor, Tensor]: (diagnosis_logits, change_logits)
+            clinical_prior: [B, 3] 临床先验向量
+            lbls_diagnosis: 诊断标签
+            lbls_change: 变化标签
+            return_features: 是否返回特征
         """
-        features = self.forward_features(x, lbls)
+        features_diagnosis, features_change = self.forward_features(
+            x, clinical_prior, lbls_diagnosis, lbls_change
+        )
 
         # 双任务输出
-        output_diagnosis = self.head_diagnosis(features)
-        output_change = self.head_change(features)
+        output_diagnosis = self.head_diagnosis(features_diagnosis)
+        output_change = self.head_change(features_change)
 
         if return_features:
-            return output_diagnosis, output_change, features
+            return output_diagnosis, output_change, features_diagnosis, features_change
         else:
             return output_diagnosis, output_change
 
+    def get_expert_utilization(self, x, clinical_prior=None, lbls_diagnosis=None, lbls_change=None):
+        """获取专家利用率（用于分析MMoE的工作情况）"""
+        gate_weights_list = []
+
+        # 设置hook来收集门控权重
+        def hook_fn(module, input, output):
+            if hasattr(module, 'mmoe') and hasattr(module.mmoe, 'get_gate_weights'):
+                # 获取MMoE模块的门控权重
+                mmoe_input = input[0]  # 假设输入是tuple的第一个元素
+                gate_weights = module.mmoe.get_gate_weights(mmoe_input)
+                gate_weights_list.append(gate_weights)
+
+        hooks = []
+        for layer in self.layers:
+            for block in layer.blocks:
+                if hasattr(block, 'mmoe'):
+                    hook = block.register_forward_hook(hook_fn)
+                    hooks.append(hook)
+
+        # 前向传播
+        with torch.no_grad():
+            _ = self.forward(x, clinical_prior, lbls_diagnosis, lbls_change)
+
+        # 移除hooks
+        for hook in hooks:
+            hook.remove()
+
+        return gate_weights_list
+
     def flops(self):
+        """计算FLOPs"""
         flops = 0
         flops += self.patch_embed.flops()
         for layer in self.layers:
@@ -1091,3 +996,90 @@ class SwinTransformerV2_AlzheimerMoE(nn.Module):
         flops += self.num_features * self.num_classes_diagnosis
         flops += self.num_features * self.num_classes_change
         return flops
+
+# ===== 使用示例 =====
+# ===== 使用示例 =====
+if __name__ == "__main__":
+    # 创建模型
+    model = SwinTransformerV2_AlzheimerMMoE(
+        img_size=256,
+        patch_size=4,
+        in_chans=3,
+        num_classes_diagnosis=3,
+        num_classes_change=3,
+        embed_dim=96,
+        depths=[2, 2, 6, 2],
+        num_heads=[3, 6, 12, 24],
+        window_size=16,
+        mlp_ratio=4.,
+        # 临床先验参数
+        # 临床先验参数
+        use_clinical_prior=True,  # 是否使用临床先验信息 (True/False)
+        prior_dim=3,  # 临床先验向量维度 (根据实际数据调整，如3维概率分布)
+        prior_hidden_dim=128,  # MLP编码器的隐藏层维度 (建议: 64/128/256)
+        fusion_stage=2,  # 在哪个stage后融合 (0/1/2/3，推荐1或2，越深语义越丰富)
+        fusion_type='adaptive'  # 融合策略 ('adaptive'/'concat'/'add'/'hadamard')
+        # - 'adaptive': 学习自适应权重（推荐）
+        # - 'concat': 拼接后投影
+        # - 'add': 加权相加
+        # - 'hadamard': 逐元素乘积+残差
+    )
+
+    # 测试输入
+    batch_size = 4
+    img = torch.randn(batch_size, 3, 256, 256)
+    clinical_prior = torch.randn(batch_size, 3)  # 3维临床先验
+
+    print("===== 维度跟踪 =====")
+    print(f"输入图像形状: {img.shape}")
+    print(f"临床先验形状: {clinical_prior.shape}")
+
+    # 测试临床编码器
+    # 融合发生在stage内部，所以维度是 96 * 2^fusion_stage
+    fusion_dim = int(96 * 2 ** 2)  # Stage 2的特征维度 = 384
+    encoder = ClinicalPriorEncoder(prior_dim=3, output_dim=fusion_dim)
+    encoded_prior = encoder(clinical_prior)
+    print(f"\n编码后的临床特征形状: {encoded_prior.shape}")  # [B, 384]
+
+    # 测试融合模块
+    # Stage 2的图像特征（downsample之前）
+    # 空间分辨率: 256/(4*2^2) = 256/16 = 16x16 = 256
+    test_image_features = torch.randn(batch_size, 256, fusion_dim)  # [B, L, C]
+    print(f"\n图像特征形状 (Stage 2内): {test_image_features.shape}")
+
+    fusion = ClinicalImageFusion(image_dim=fusion_dim, clinical_dim=fusion_dim)
+    fused_features = fusion(test_image_features, encoded_prior)
+    print(f"融合后的特征形状: {fused_features.shape}")  # [B, L, C]
+
+    # 前向传播
+    print("\n===== 完整模型测试 =====")
+    diag_out, change_out = model(img, clinical_prior=clinical_prior)
+
+    print(f"诊断输出形状: {diag_out.shape}")
+    print(f"变化输出形状: {change_out.shape}")
+
+    # 不使用临床先验的情况
+    diag_out2, change_out2 = model(img, clinical_prior=None)
+    print(f"\n不使用临床先验:")
+    print(f"诊断输出形状: {diag_out2.shape}")
+    print(f"变化输出形状: {change_out2.shape}")
+
+    # 维度计算说明
+    print("\n===== 维度计算说明 (256x256输入) =====")
+    print("Swin Transformer维度变化:")
+    print(f"输入: 256x256")
+    print(f"Patch Embed后: 64x64, dim=96")
+    print(f"Stage 0: 64x64, dim=96 (融合点 fusion_stage=0)")
+    print(f"├─ 后接PatchMerging: 32x32, dim=192")
+    print(f"Stage 1: 32x32, dim=192 (融合点 fusion_stage=1)")
+    print(f"├─ 后接PatchMerging: 16x16, dim=384")
+    print(f"Stage 2: 16x16, dim=384 (融合点 fusion_stage=2)")
+    print(f"├─ 后接PatchMerging: 8x8, dim=768")
+    print(f"Stage 3: 8x8, dim=768 (融合点 fusion_stage=3)")
+    print(f"└─ 无PatchMerging，直接到分类头")
+    print(f"\n融合维度计算：embed_dim * 2^fusion_stage")
+    print(f"- fusion_stage=0: 96 * 2^0 = 96")
+    print(f"- fusion_stage=1: 96 * 2^1 = 192")
+    print(f"- fusion_stage=2: 96 * 2^2 = 384")
+    print(f"- fusion_stage=3: 96 * 2^3 = 768")
+    print(f"\nWindow size = 16, 在Stage 3时会自动调整为8以适应特征图大小")

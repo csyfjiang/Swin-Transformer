@@ -24,9 +24,32 @@ from datetime import datetime
 # Import custom modules
 from config import get_config
 from models import build_model
-from trainer import trainer_alzheimer
+from trainer import trainer_alzheimer_mmoe
 from logger import create_logger
 
+import warnings
+import logging
+# 忽略特定的警告信息
+# 配置警告过滤
+warnings.filterwarnings("ignore", message=".*Fused window process.*")
+warnings.filterwarnings("ignore", message=".*Tutel.*")
+
+# 降低某些模块的日志级别
+logging.getLogger("models").setLevel(logging.ERROR)
+
+# 忽略 FutureWarning
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# 或者更具体地忽略某些库的 FutureWarning
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+warnings.filterwarnings("ignore", category=FutureWarning, module="numpy")
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+
+# 如果想忽略 DeprecationWarning 也可以添加
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# 忽略 UserWarning（比如 PyTorch 的一些提示）
+warnings.filterwarnings("ignore", category=UserWarning)
 # pytorch major version (1.x or 2.x)
 PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
 
@@ -35,7 +58,9 @@ def parse_args():
     parser = argparse.ArgumentParser('Alzheimer Dual-Task Classification Training')
 
     # Basic settings
-    parser.add_argument('--cfg', type=str, required=True, metavar="FILE",
+    parser.add_argument('--cfg', type=str,
+                        default='./configs/swin_admoe/swin_admoe_tiny_finetune_patch4_window16_256.yaml',
+                        metavar="FILE",
                         help='path to config file')
     parser.add_argument('--opts', help="Modify config options by adding 'KEY VALUE' pairs",
                         default=None, nargs='+')
@@ -176,7 +201,7 @@ def prepare_config(args):
 
     # Set output directory
     config.defrost()
-    config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
+    config.OUTPUT = args.output  # 只使用基础输出目录
     config.freeze()
 
     return config
@@ -235,6 +260,8 @@ def main():
         seed=config.SEED,
         output_dir=config.OUTPUT,
 
+        model_name=config.MODEL.NAME,  # 添加模型名称
+        tag=config.TAG,  # 添加实验标签
         # Data settings
         data_path=config.DATA.DATA_PATH,
         batch_size=config.DATA.BATCH_SIZE,
@@ -256,8 +283,8 @@ def main():
         label_smoothing=config.MODEL.LABEL_SMOOTHING,
 
         # Task weights
-        weight_diagnosis=config.LOSS.WEIGHT_DIAGNOSIS,
-        weight_change=config.LOSS.WEIGHT_CHANGE,
+        weight_diagnosis=args.weight_diagnosis,
+        weight_change=args.weight_change,
 
         # Early stopping
         patience=config.EARLY_STOP.PATIENCE,
@@ -266,6 +293,13 @@ def main():
         wandb_project=args.wandb_project or config.WANDB.PROJECT,
         wandb_run_name=args.wandb_run_name or f"{config.MODEL.NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         wandb_offline=args.wandb_offline,
+
+        # Warmup设置
+        warmup_epochs=getattr(config.TRAIN, 'WARMUP_EPOCHS', 5),
+        warmup_lr=getattr(config.TRAIN, 'WARMUP_LR', 1e-6),
+
+        # 添加预训练轮数设置
+        pretrain_epochs=getattr(config.TRAIN, 'PRETRAIN_EPOCHS', config.TRAIN.EPOCHS // 2),
 
         # Config object
         config=config,
@@ -300,7 +334,7 @@ def main():
 
     # Start training
     logger.info("Start training")
-    trainer_alzheimer(trainer_args, model, config.OUTPUT)
+    trainer_alzheimer_mmoe(trainer_args, model, config.OUTPUT)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,8 @@
 """
-简化版阿尔兹海默症NPZ数据加载器
+简化版阿尔兹海默症NPZ数据加载器 - 支持prior向量
 - 只保留裁剪和旋转增强
 - 去除所有归一化（因为数据已经z-score标准化）
+- 添加prior向量支持
 - 打印数据范围
 """
 import os
@@ -91,7 +92,7 @@ class NPZToTensor(object):
 
 
 class AlzheimerNPZDataset(Dataset):
-    """阿尔兹海默症NPZ数据集"""
+    """阿尔兹海默症NPZ数据集 - 支持prior向量"""
     def __init__(self, data_dir, split='train', transform=None, file_list=None, debug=False):
         self.data_dir = data_dir
         self.split = split
@@ -131,19 +132,29 @@ class AlzheimerNPZDataset(Dataset):
             if self.debug and idx == 0:
                 print(f"\n[调试] 原始NPZ数据:")
                 print(f"  - 文件: {file_name}")
-                print(f"  - Shape: {slice_data.shape}")
-                print(f"  - 范围: [{slice_data.min():.4f}, {slice_data.max():.4f}]")
-                print(f"  - 均值: {slice_data.mean():.4f}, 标准差: {slice_data.std():.4f}")
+                print(f"  - Slice shape: {slice_data.shape}")
+                print(f"  - Slice范围: [{slice_data.min():.4f}, {slice_data.max():.4f}]")
+                print(f"  - Slice均值: {slice_data.mean():.4f}, 标准差: {slice_data.std():.4f}")
 
             # 获取标签
             label = int(data['label'][()]) if data['label'].shape == () else int(data['label'])
             change_label = int(data['change_label'][()]) if data['change_label'].shape == () else int(data['change_label'])
+
+            # ===== 新增：获取prior向量 =====
+            prior = data['prior'].astype(np.float32)  # shape: (3,)
+
+            # 调试模式：打印prior信息
+            if self.debug and idx == 0:
+                print(f"  - Prior shape: {prior.shape}")
+                print(f"  - Prior values: {prior}")
+                print(f"  - Prior sum: {prior.sum():.6f}")  # 检查是否为概率分布
 
             # 创建样本字典
             sample = {
                 'slice': slice_data,
                 'label': label,
                 'change_label': change_label,
+                'prior': prior,  # 新增prior字段
                 'case_name': os.path.splitext(os.path.basename(file_name))[0]
             }
 
@@ -159,7 +170,7 @@ class AlzheimerNPZDataset(Dataset):
 
 
 class AlzheimerTransform(object):
-    """简化的transform类 - 只保留裁剪和旋转"""
+    """简化的transform类 - 只保留裁剪和旋转，支持prior向量"""
     def __init__(self, output_size, is_train=True, use_crop=True, use_rotation=True, print_stats=False):
         self.output_size = output_size
         self.is_train = is_train
@@ -172,12 +183,13 @@ class AlzheimerTransform(object):
 
         # ===== 1. 旋转增强（仅训练时）=====
         if self.is_train and self.use_rotation:
-            if random.random() > 0.5:
-                # 90度旋转
-                image = random_rot_flip(image)
-            elif random.random() > 0.5:
-                # 小角度旋转
-                image = random_rotate(image)
+            image = random_rotate(image)  # 100%概率
+            # if random.random() > 0.5:
+            #     # 90度旋转
+            #     image = random_rot_flip(image)
+            # elif random.random() > 0.5:
+            #     # 小角度旋转
+            #     image = random_rotate(image)
 
         # ===== 2. 裁剪或调整大小 =====
         h, w = image.shape
@@ -219,11 +231,15 @@ class AlzheimerTransform(object):
         # ===== 4. 转换为tensor（不做归一化）=====
         image = self.to_tensor(image)
 
+        # ===== 5. 处理prior向量 =====
+        prior = torch.from_numpy(sample['prior']).float()  # 转换为tensor
+
         # 返回最终格式
         return {
             'image': image,
             'label': torch.tensor(sample['label'], dtype=torch.long),
             'change_label': torch.tensor(sample['change_label'], dtype=torch.long),
+            'prior': prior,  # 新增prior字段
             'case_name': sample['case_name']
         }
 
@@ -278,7 +294,10 @@ def build_dataset(is_train, config):
             )
 
         # 设置类别数
-        nb_classes = 3  # 3个类别(1,2,3)
+        nb_classes = {
+            'diagnosis': 3,  # CN(1), MCI(2), Dementia(3)
+            'change': 3  # Stable(1), Conversion(2), Reversion(3)
+        }
 
     else:
         raise NotImplementedError(f"Dataset {config.DATA.DATASET} not supported")
@@ -289,7 +308,11 @@ def build_dataset(is_train, config):
 def build_loader_finetune(config):
     """构建微调阶段的数据加载器"""
     config.defrost()
-    dataset_train, config.MODEL.NUM_CLASSES = build_dataset(is_train=True, config=config)
+    dataset_train, _ = build_dataset(is_train=True, config=config)
+    config.MODEL.NUM_CLASSES = 3  # 保持兼容性
+    config.MODEL.NUM_CLASSES_DIAGNOSIS = config.MODEL.SWIN_ADMOE.NUM_CLASSES_DIAGNOSIS
+    config.MODEL.NUM_CLASSES_CHANGE = config.MODEL.SWIN_ADMOE.NUM_CLASSES_CHANGE
+
     config.freeze()
     dataset_val, _ = build_dataset(is_train=False, config=config)
 
@@ -376,14 +399,14 @@ if __name__ == "__main__":
             # 显示原始图像
             img_orig = original_sample['image'][0].numpy()
             axes[0, i].imshow(img_orig, cmap='gray')
-            axes[0, i].set_title(f"Original\nRange:[{img_orig.min():.2f}, {img_orig.max():.2f}]")
+            axes[0, i].set_title(f"Original\nRange:[{img_orig.min():.2f}, {img_orig.max():.2f}]\nPrior:{original_sample['prior'].numpy()}")
             axes[0, i].axis('off')
 
             # 显示增强后的图像
             aug_sample = dataset[idx]
             img_aug = aug_sample['image'][0].numpy()
             axes[1, i].imshow(img_aug, cmap='gray')
-            axes[1, i].set_title(f"Augmented {i+1}\nRange:[{img_aug.min():.2f}, {img_aug.max():.2f}]")
+            axes[1, i].set_title(f"Augmented {i+1}\nRange:[{img_aug.min():.2f}, {img_aug.max():.2f}]\nPrior:{aug_sample['prior'].numpy()}")
             axes[1, i].axis('off')
 
         plt.tight_layout()
@@ -398,7 +421,7 @@ if __name__ == "__main__":
             config.DATA.DATA_PATH = data_path
 
         print("="*60)
-        print("测试阿尔兹海默症NPZ数据加载器（简化版）")
+        print("测试阿尔兹海默症NPZ数据加载器（简化版 + Prior支持）")
         print("="*60)
 
         # 1. 测试基本数据加载
@@ -428,6 +451,9 @@ if __name__ == "__main__":
             print(f"  - Image dtype: {sample['image'].dtype}")
             print(f"  - Label: {sample['label']}")
             print(f"  - Change label: {sample['change_label']}")
+            print(f"  - Prior shape: {sample['prior'].shape}")
+            print(f"  - Prior values: {sample['prior']}")
+            print(f"  - Prior sum: {sample['prior'].sum():.6f}")
             print(f"  - Case name: {sample['case_name']}")
 
         except Exception as e:
@@ -470,11 +496,17 @@ if __name__ == "__main__":
             print(f"✓ 成功加载批次")
             print(f"  - Batch images shape: {batch['image'].shape}")
             print(f"  - Batch images dtype: {batch['image'].dtype}")
+            print(f"  - Batch priors shape: {batch['prior'].shape}")
+            print(f"  - Batch priors dtype: {batch['prior'].dtype}")
 
             # 打印批次数据范围
             batch_data = batch['image'].numpy()
+            batch_priors = batch['prior'].numpy()
             print(f"  - Batch数据范围: [{batch_data.min():.4f}, {batch_data.max():.4f}]")
             print(f"  - Batch均值: {batch_data.mean():.4f}, 标准差: {batch_data.std():.4f}")
+            print(f"  - Prior values sample:")
+            for j in range(min(2, batch_priors.shape[0])):
+                print(f"    Sample {j}: {batch_priors[j]} (sum: {batch_priors[j].sum():.6f})")
 
             # 显示批次中的图像
             actual_batch_size = batch['image'].shape[0]
@@ -484,21 +516,25 @@ if __name__ == "__main__":
                 # 只有一个图像
                 fig, ax = plt.subplots(1, 1, figsize=(4, 4))
                 img = batch['image'][0, 0].numpy()
+                prior_vals = batch['prior'][0].numpy()
                 ax.imshow(img, cmap='gray')
                 ax.set_title(f"Label: {batch['label'][0]}, Change: {batch['change_label'][0]}\n"
-                           f"Range: [{img.min():.2f}, {img.max():.2f}]")
+                           f"Range: [{img.min():.2f}, {img.max():.2f}]\n"
+                           f"Prior: [{prior_vals[0]:.3f}, {prior_vals[1]:.3f}, {prior_vals[2]:.3f}]")
                 ax.axis('off')
             else:
                 # 多个图像
                 fig, axes = plt.subplots(1, num_show, figsize=(num_show*3, 3))
                 for j in range(num_show):
                     img = batch['image'][j, 0].numpy()
+                    prior_vals = batch['prior'][j].numpy()
                     axes[j].imshow(img, cmap='gray')
                     axes[j].set_title(f"L:{batch['label'][j]}, C:{batch['change_label'][j]}\n"
-                                    f"[{img.min():.1f}, {img.max():.1f}]")
+                                    f"[{img.min():.1f}, {img.max():.1f}]\n"
+                                    f"P:[{prior_vals[0]:.2f},{prior_vals[1]:.2f},{prior_vals[2]:.2f}]")
                     axes[j].axis('off')
 
-            plt.suptitle("Batch Sample (Z-score Data)")
+            plt.suptitle("Batch Sample (Z-score Data + Prior)")
             plt.tight_layout()
             plt.show()
 
@@ -508,6 +544,7 @@ if __name__ == "__main__":
         print("\n4. 数据集统计信息...")
         all_labels = []
         all_change_labels = []
+        all_priors = []
         all_mins = []
         all_maxs = []
 
@@ -519,6 +556,7 @@ if __name__ == "__main__":
             sample = dataset[i]
             all_labels.append(sample['label'].item())
             all_change_labels.append(sample['change_label'].item())
+            all_priors.append(sample['prior'].numpy())
 
             # 记录数据范围
             img_data = sample['image'][0].numpy()
@@ -535,6 +573,13 @@ if __name__ == "__main__":
             print(f"\n  - 数据范围统计:")
             print(f"    最小值范围: [{np.min(all_mins):.4f}, {np.max(all_mins):.4f}]")
             print(f"    最大值范围: [{np.min(all_maxs):.4f}, {np.max(all_maxs):.4f}]")
+
+            print(f"\n  - Prior统计:")
+            all_priors = np.array(all_priors)
+            print(f"    Prior shape: {all_priors.shape}")
+            print(f"    Prior均值: {all_priors.mean(axis=0)}")
+            print(f"    Prior标准差: {all_priors.std(axis=0)}")
+            print(f"    Prior范围: [{all_priors.min(axis=0)}, {all_priors.max(axis=0)}]")
 
         print("\n测试完成！")
 
