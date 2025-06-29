@@ -1,0 +1,28 @@
+DATA:
+  IMG_SIZE: 256
+MODEL:
+  TYPE: swin_admoe
+  NAME: swin_admoe_tiny_alzheimer_finetune_patch4_window16_256
+  DROP_PATH_RATE: 0.02  # Alzheimer数据集较小，使用很小的drop path
+  SWIN_ADMOE:
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 6, 2 ]
+    NUM_HEADS: [ 3, 6, 12, 24 ]
+    WINDOW_SIZE: 16
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [16, 16, 16, 8]  # 如果从256分辨率模型加载
+    SHIFT_MLP_RATIO: 1.0
+    IS_PRETRAIN: False  # 微调阶段，激活门控网络学习
+    USE_SHIFTED_LAST_LAYER: False
+TRAIN:
+  EPOCHS: 200  # Alzheimer数据集需要更多轮次
+  WARMUP_EPOCHS: 10
+  WEIGHT_DECAY: 1e-6  # 非常小的权重衰减，防止过拟合
+  BASE_LR: 1e-5  # 很小的学习率，精细调整
+  WARMUP_LR: 1e-8
+  MIN_LR: 1e-7

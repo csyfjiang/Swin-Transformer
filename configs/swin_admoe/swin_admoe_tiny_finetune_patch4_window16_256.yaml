@@ -1,0 +1,145 @@
+# Alzheimer's Disease Dual-Task Classification Configuration
+# config/swin_admoe_tiny_256_finetune.yaml
+
+DATA:
+  DATASET: 'alzheimer'
+  DATA_PATH: 'Z://yufengjiang//data//slice'  # Windows path 'Z://yufengjiang//data//slice' 'D://codebase//Swin-Transformer//examples'
+  IMG_SIZE: 256
+  BATCH_SIZE: 16
+  NUM_WORKERS: 4
+  PIN_MEMORY: True
+  INTERPOLATION: 'bicubic'
+
+MODEL:
+  TYPE: swin_admoe
+  NAME: swin_admoe_tiny_finetune_patch4_window16_256
+  NUM_CLASSES: 3  # Keep for compatibility
+  DROP_RATE: 0.0
+  DROP_PATH_RATE: 0.1
+  LABEL_SMOOTHING: 0.1
+
+  SWIN_ADMOE:
+    # Dual-task class numbers
+    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3)
+    NUM_CLASSES_CHANGE: 3     # Stable(1), Conversion(2), Reversion(3)
+
+    # Model architecture parameters
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [2, 2, 6, 2]
+    NUM_HEADS: [3, 6, 12, 24]
+    WINDOW_SIZE: 16
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [12, 12, 12, 6]
+    SHIFT_MLP_RATIO: 1.0
+    IS_PRETRAIN: False  # Fine-tuning stage, use learned gating
+    USE_SHIFTED_LAST_LAYER: False
+
+# Data augmentation settings
+AUG:
+  # Basic augmentation
+  COLOR_JITTER: 0.0  # Medical images don't need color jitter
+  AUTO_AUGMENT: 'none'  # Options: 'rand-m5-mstd0.5-inc1', 'none'
+
+  # Random Erasing
+  REPROB: 0.0  # Usually not used for medical images
+  REMODE: 'pixel'
+  RECOUNT: 1
+
+  # Mixup/CutMix (use cautiously for medical images)
+  MIXUP: 0.0
+  CUTMIX: 0.0
+  CUTMIX_MINMAX: null
+  MIXUP_PROB: 0.0
+  MIXUP_SWITCH_PROB: 0.5
+  MIXUP_MODE: 'batch'
+
+# Training settings
+TRAIN:
+  START_EPOCH: 0
+  EPOCHS: 200
+
+  # Warmup settings
+  WARMUP_EPOCHS: 10      # warmup epochs
+  WARMUP_LR: 1e-6       # warmup learning rate
+
+  # Learning rate settings
+  BASE_LR: 1e-4         # base learning rate
+  MIN_LR: 1e-6          # minimum learning rate
+
+  # Pretrain settings
+  PRETRAIN_EPOCHS: 20   # Pretrain stage epochs
+
+  # Weight decay and regularization
+  WEIGHT_DECAY: 0.05
+
+  # Gradient settings
+  CLIP_GRAD: 1.0
+  AUTO_RESUME: True
+  ACCUMULATION_STEPS: 1
+  USE_CHECKPOINT: False  # Set to True if GPU memory is insufficient
+
+  # Optimizer
+  OPTIMIZER:
+    NAME: 'adamw'
+    EPS: 1e-8
+    BETAS: [0.9, 0.999]
+    MOMENTUM: 0.9
+
+  # LR scheduler
+  LR_SCHEDULER:
+    NAME: 'cosine'
+    DECAY_EPOCHS: 30
+    DECAY_RATE: 0.1
+    WARMUP_PREFIX: True
+
+# Test settings (only use existing fields)
+TEST:
+  CROP: False  # Medical images usually don't need cropping
+  SEQUENTIAL: False
+  SHUFFLE: False
+
+# AMP settings
+AMP_ENABLE: True
+
+# Other settings
+SEED: 42
+OUTPUT: './output/alzheimer_finetune'
+TAG: 'dual_task_v1'
+SAVE_FREQ: 10
+PRINT_FREQ: 50
+EVAL_MODE: False
+THROUGHPUT_MODE: False
+LOCAL_RANK: 0
+
+# Distributed training
+FUSED_WINDOW_PROCESS: False
+FUSED_LAYERNORM: False
+
+# Custom settings that need to be added to config.py
+# WandB settings (for trainer)
+WANDB:
+  PROJECT: 'alzheimer-dual-classification'
+  NAME: 'swin_admoe_finetune'
+  TAGS: ['dual-task', 'alzheimer', 'swin-admoe']
+
+# Dual-task weight settings
+LOSS:
+  WEIGHT_DIAGNOSIS: 1.0  # Diagnosis task weight
+  WEIGHT_CHANGE: 1.0     # Change task weight
+
+# Evaluation settings
+EVAL:
+  INTERVAL: 10  # Validate every 10 epochs
+  SAVE_BEST: True
+  METRICS: ['accuracy', 'f1_score', 'confusion_matrix']
+
+# Early stopping settings
+EARLY_STOP:
+  ENABLE: True
+  PATIENCE: 5
+  MONITOR: 'val_loss'  # or 'val_acc_avg'

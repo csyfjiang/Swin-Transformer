@@ -1,0 +1,28 @@
+DATA:
+  IMG_SIZE: 256
+MODEL:
+  TYPE: swin_admoe
+  NAME: swin_admoe_base_finetune_window12to16_192to256
+  DROP_PATH_RATE: 0.1
+  SWIN_ADMOE:
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 128
+    DEPTHS: [ 2, 2, 18, 2 ]
+    NUM_HEADS: [ 4, 8, 16, 32 ]
+    WINDOW_SIZE: 16
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [12, 12, 12, 6]  # 从192分辨率window12模型加载
+    SHIFT_MLP_RATIO: 1.0
+    IS_PRETRAIN: False  # 微调阶段
+    USE_SHIFTED_LAST_LAYER: False
+TRAIN:
+  EPOCHS: 50  # 渐进微调使用较少轮次
+  WARMUP_EPOCHS: 3
+  WEIGHT_DECAY: 3e-5
+  BASE_LR: 4e-5
+  WARMUP_LR: 4e-8
+  MIN_LR: 4e-6

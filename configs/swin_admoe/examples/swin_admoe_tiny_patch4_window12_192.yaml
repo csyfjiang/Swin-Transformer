@@ -1,0 +1,29 @@
+# swin_admoe_tiny_patch4_window12_192.yaml
+DATA:
+  IMG_SIZE: 192
+MODEL:
+  TYPE: swin_admoe
+  NAME: swin_admoe_tiny_patch4_window12_192
+  DROP_PATH_RATE: 0.1
+  SWIN_ADMOE:
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 6, 2 ]
+    NUM_HEADS: [ 3, 6, 12, 24 ]
+    WINDOW_SIZE: 12
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [0, 0, 0, 0]
+    SHIFT_MLP_RATIO: 1.0
+    IS_PRETRAIN: True
+    USE_SHIFTED_LAST_LAYER: False
+TRAIN:
+  EPOCHS: 300
+  WARMUP_EPOCHS: 20
+  WEIGHT_DECAY: 0.05
+  BASE_LR: 1.0e-3
+  WARMUP_LR: 1.0e-6
+  MIN_LR: 1.0e-5

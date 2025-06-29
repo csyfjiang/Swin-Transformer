@@ -1,0 +1,28 @@
+DATA:
+  IMG_SIZE: 256
+MODEL:
+  TYPE: swin_admoe
+  NAME: swin_admoe_small_finetune_patch4_window16_256
+  DROP_PATH_RATE: 0.08  # small模型使用中等的drop path
+  SWIN_ADMOE:
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 18, 2 ]
+    NUM_HEADS: [ 3, 6, 12, 24 ]
+    WINDOW_SIZE: 16
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [12, 12, 12, 6]  # 如果从192分辨率模型加载
+    SHIFT_MLP_RATIO: 1.0
+    IS_PRETRAIN: False  # 微调阶段，使用学习性门控
+    USE_SHIFTED_LAST_LAYER: False
+TRAIN:
+  EPOCHS: 100
+  WARMUP_EPOCHS: 5
+  WEIGHT_DECAY: 8e-5  # small模型使用适中的权重衰减
+  BASE_LR: 4e-5  # small模型微调学习率
+  WARMUP_LR: 4e-8
+  MIN_LR: 4e-6
