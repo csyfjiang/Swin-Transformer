@@ -1,8 +1,9 @@
 # --------------------------------------------------------
-# Swin Transformer V2 with AlzheimerMMoE
+# Swin Transformer V2 with AlzheimerMMoE and SimMIM
 # Copyright (c) 2022 Microsoft
 # Licensed under The MIT License [see LICENSE for details]
 # Written by Ze Liu
+# Modified for Alzheimer's Disease MMoE with SimMIM
 # --------------------------------------------------------
 
 import torch
@@ -114,7 +115,7 @@ class AlzheimerMMoE(nn.Module):
         self.change_transform = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(drop)
 
-    def forward(self, x, lbls_diagnosis=None, lbls_change=None, is_pretrain=True, temperature=1.0):
+    def forward(self, x, lbls_diagnosis=None, lbls_change=None, is_pretrain=True, temperature=1.0, task='both'):
         """
         Args:
             x: 输入特征 [B, L, dim]
@@ -122,12 +123,13 @@ class AlzheimerMMoE(nn.Module):
             lbls_change: 变化标签 [B] (0: Stable, 1: Conversion, 2: Reversion)
             is_pretrain: 是否为预训练阶段
             temperature: softmax温度参数
+            task: 'both', 'diagnosis', 'change', or 'reconstruction' (for SimMIM)
         Returns:
-            tuple: (diagnosis_output, change_output)
+            tuple: (diagnosis_output, change_output) or single output for reconstruction
         """
         batch_size, seq_len, feature_dim = x.shape
-        device = x.device  # 获取输入tensor的设备
-        dtype = x.dtype  # 获取输入tensor的数据类型
+        device = x.device
+        dtype = x.dtype
 
         # 计算所有专家的输出
         expert_outputs = []
@@ -136,6 +138,35 @@ class AlzheimerMMoE(nn.Module):
             expert_outputs.append(expert_output)
         expert_outputs = torch.stack(expert_outputs, dim=-1)  # [B, L, dim, num_experts]
 
+        # For SimMIM reconstruction task - 只根据诊断标签分配专家
+        if task == 'reconstruction':
+            # 在重建任务中，只根据诊断标签选择专家
+            if lbls_diagnosis is not None:
+                # 基于诊断标签的专家选择
+                reconstruction_weights = torch.zeros(batch_size, seq_len, self.num_experts,
+                                                     device=device, dtype=dtype)
+                reconstruction_weights[:, :, 0] = 0.4  # shared expert始终保持40%权重
+
+                # 根据诊断标签激活对应专家（60%权重）
+                for i, lbl in enumerate(lbls_diagnosis):
+                    if lbl == 2:  # AD
+                        reconstruction_weights[i, :, 1] = 0.6  # AD-focused expert
+                    elif lbl == 1:  # MCI
+                        reconstruction_weights[i, :, 2] = 0.6  # MCI-focused expert
+                    elif lbl == 0:  # CN
+                        reconstruction_weights[i, :, 3] = 0.6  # CN-focused expert
+            else:
+                # 没有标签时，平均使用所有专家
+                reconstruction_weights = torch.ones(batch_size, seq_len, self.num_experts,
+                                                    device=device, dtype=dtype) / self.num_experts
+
+            # 计算重建输出
+            reconstruction_weights_expanded = reconstruction_weights.unsqueeze(2)  # [B, L, 1, num_experts]
+            reconstruction_output = torch.sum(expert_outputs * reconstruction_weights_expanded, dim=-1)  # [B, L, dim]
+
+            return reconstruction_output
+
+        # Original dual-task logic
         # === 诊断任务路由 ===
         if is_pretrain and lbls_diagnosis is not None:
             # 预训练阶段：基于诊断标签的先验路由
@@ -368,6 +399,7 @@ class SwinTransformerBlock_ADMMoE(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2_diagnosis = norm_layer(dim)  # 诊断任务的norm
         self.norm2_change = norm_layer(dim)  # 变化任务的norm
+        self.norm2_reconstruction = norm_layer(dim)  # 重建任务的norm
 
         # 使用AlzheimerMMoE替换标准MLP
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -404,7 +436,7 @@ class SwinTransformerBlock_ADMMoE(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, x, lbls_diagnosis=None, lbls_change=None):
+    def forward(self, x, lbls_diagnosis=None, lbls_change=None, task='both'):
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -440,25 +472,41 @@ class SwinTransformerBlock_ADMMoE(nn.Module):
         # FFN with MMoE
         x = shortcut + self.drop_path(x)
 
-        # 分别对两个任务应用norm
-        x_diagnosis_norm = self.norm2_diagnosis(x)
-        x_change_norm = self.norm2_change(x)
+        if task == 'reconstruction':
+            # For SimMIM reconstruction
+            x_norm = self.norm2_reconstruction(x)
+            reconstruction_output = self.mmoe(
+                x_norm,
+                lbls_diagnosis=lbls_diagnosis,
+                lbls_change=lbls_change,
+                is_pretrain=self.is_pretrain,
+                temperature=1.0,
+                task='reconstruction'
+            )
+            x = x + self.drop_path(reconstruction_output)
+            return x
+        else:
+            # Original dual-task logic
+            # 分别对两个任务应用norm
+            x_diagnosis_norm = self.norm2_diagnosis(x)
+            x_change_norm = self.norm2_change(x)
 
-        # 使用平均norm结果作为MMoE输入
-        mmoe_input = (x_diagnosis_norm + x_change_norm) / 2
-        diagnosis_output, change_output = self.mmoe(
-            mmoe_input,
-            lbls_diagnosis=lbls_diagnosis,
-            lbls_change=lbls_change,
-            is_pretrain=self.is_pretrain,
-            temperature=1.0
-        )
+            # 使用平均norm结果作为MMoE输入
+            mmoe_input = (x_diagnosis_norm + x_change_norm) / 2
+            diagnosis_output, change_output = self.mmoe(
+                mmoe_input,
+                lbls_diagnosis=lbls_diagnosis,
+                lbls_change=lbls_change,
+                is_pretrain=self.is_pretrain,
+                temperature=1.0,
+                task=task
+            )
 
-        # 应用drop_path
-        x_diagnosis = x + self.drop_path(diagnosis_output)
-        x_change = x + self.drop_path(change_output)
+            # 应用drop_path
+            x_diagnosis = x + self.drop_path(diagnosis_output)
+            x_change = x + self.drop_path(change_output)
 
-        return x_diagnosis, x_change
+            return x_diagnosis, x_change
 
     def flops(self):
         flops = 0
@@ -549,21 +597,34 @@ class BasicLayerMMoE(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, lbls_diagnosis=None, lbls_change=None):
-        # 需要追踪两个任务的特征
-        x_diagnosis, x_change = x, x
+    def forward(self, x, lbls_diagnosis=None, lbls_change=None, task='both'):
+        if task == 'reconstruction':
+            # For SimMIM reconstruction
+            for blk in self.blocks:
+                if self.use_checkpoint:
+                    x = checkpoint.checkpoint(blk, x, lbls_diagnosis, lbls_change, task)
+                else:
+                    x = blk(x, lbls_diagnosis, lbls_change, task)
 
-        for blk in self.blocks:
-            if self.use_checkpoint:
-                x_diagnosis, x_change = checkpoint.checkpoint(blk, x_diagnosis, lbls_diagnosis, lbls_change)
-            else:
-                x_diagnosis, x_change = blk(x_diagnosis, lbls_diagnosis, lbls_change)
+            if self.downsample is not None:
+                x = self.downsample(x)
 
-        if self.downsample is not None:
-            x_diagnosis = self.downsample(x_diagnosis)
-            x_change = self.downsample(x_change)
+            return x
+        else:
+            # Original dual-task logic
+            x_diagnosis, x_change = x, x
 
-        return x_diagnosis, x_change
+            for blk in self.blocks:
+                if self.use_checkpoint:
+                    x_diagnosis, x_change = checkpoint.checkpoint(blk, x_diagnosis, lbls_diagnosis, lbls_change)
+                else:
+                    x_diagnosis, x_change = blk(x_diagnosis, lbls_diagnosis, lbls_change)
+
+            if self.downsample is not None:
+                x_diagnosis = self.downsample(x_diagnosis)
+                x_change = self.downsample(x_change)
+
+            return x_diagnosis, x_change
 
     def set_pretrain_mode(self, is_pretrain):
         """设置预训练模式"""
@@ -769,8 +830,8 @@ class ClinicalImageFusion(nn.Module):
 
 class SwinTransformerV2_AlzheimerMMoE(nn.Module):
     """
-    扩展版Swin Transformer V2 with Alzheimer MMoE
-    集成临床先验信息
+    扩展版Swin Transformer V2 with Alzheimer MMoE and SimMIM
+    集成临床先验信息和SimMIM预训练
     """
 
     def __init__(self,
@@ -807,6 +868,10 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
         # 临床先验相关参数
         self.use_clinical_prior = use_clinical_prior
         self.fusion_stage = fusion_stage
+
+        # For SimMIM
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        trunc_normal_(self.mask_token, mean=0., std=.02)
 
         # Patch embedding
         self.patch_embed = PatchEmbed(
@@ -879,10 +944,23 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
         # Task-specific norms and heads
         self.norm_diagnosis = norm_layer(self.num_features)
         self.norm_change = norm_layer(self.num_features)
+        self.norm = norm_layer(self.num_features)  # For SimMIM
         self.avgpool = nn.AdaptiveAvgPool1d(1)
 
         self.head_diagnosis = nn.Linear(self.num_features, num_classes_diagnosis)
         self.head_change = nn.Linear(self.num_features, num_classes_change)
+
+        # For SimMIM decoder
+        # 计算encoder的总下采样倍数
+        self.encoder_stride = patch_size * (2 ** (self.num_layers - 1))  # patch_size=4, 4个stage，总共下采样32倍
+
+        self.decoder = nn.Sequential(
+            nn.Conv2d(
+                in_channels=self.num_features,
+                out_channels=self.encoder_stride ** 2 * 3,  # 32^2 * 3 = 3072
+                kernel_size=1),
+            nn.PixelShuffle(self.encoder_stride),  # 上采样32倍
+        )
 
         self.apply(self._init_weights)
 
@@ -895,16 +973,38 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward_features(self, x, clinical_prior=None, lbls_diagnosis=None, lbls_change=None):
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed', 'mask_token'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table', 'cpb_mlp'}
+
+    def forward_features(self, x, clinical_prior=None, lbls_diagnosis=None, lbls_change=None, mask=None):
         """
         Args:
             x: 图像输入
             clinical_prior: [B, 3] 临床先验向量
             lbls_diagnosis: 诊断标签
             lbls_change: 变化标签
+            mask: SimMIM mask [B, num_patches]
         """
         # Patch embedding
         x = self.patch_embed(x)
+
+        # Apply mask for SimMIM
+        if mask is not None:
+            B, L, _ = x.shape
+            mask_tokens = self.mask_token.expand(B, L, -1)
+            # mask应该是[B, L]的形状
+            if mask.dim() == 2 and mask.shape[1] == L:
+                w = mask.unsqueeze(-1).type_as(mask_tokens)
+            else:
+                # 如果mask维度不对，尝试reshape
+                w = mask.view(B, L).unsqueeze(-1).type_as(mask_tokens)
+            x = x * (1. - w) + mask_tokens * w
+
         if self.ape:
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
@@ -915,7 +1015,28 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
         else:
             clinical_features = None
 
-        # 通过各层
+        # For SimMIM reconstruction
+        if mask is not None:
+            # 通过各层进行重建
+            for i_layer, layer in enumerate(self.layers):
+                x = layer(x, lbls_diagnosis, lbls_change, task='reconstruction')
+
+                # 在指定stage后融合临床特征
+                if self.use_clinical_prior and clinical_features is not None and i_layer == self.fusion_stage:
+                    x = self.clinical_fusion(x, clinical_features)
+
+            # Final normalization for reconstruction
+            x = self.norm(x)
+
+            # Reshape for decoder
+            x = x.transpose(1, 2)
+            B, C, L = x.shape
+            H = W = int(L ** 0.5)
+            x = x.reshape(B, C, H, W)
+
+            return x
+
+        # Original dual-task forward
         x_diagnosis, x_change = x, x
 
         for i_layer, layer in enumerate(self.layers):
@@ -940,7 +1061,7 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
 
         return x_diagnosis, x_change
 
-    def forward(self, x, clinical_prior=None, lbls_diagnosis=None, lbls_change=None, return_features=False):
+    def forward(self, x, clinical_prior=None, lbls_diagnosis=None, lbls_change=None, return_features=False, mask=None):
         """
         前向传播
         Args:
@@ -949,7 +1070,15 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
             lbls_diagnosis: 诊断标签
             lbls_change: 变化标签
             return_features: 是否返回特征
+            mask: SimMIM mask
         """
+        if mask is not None:
+            # SimMIM reconstruction
+            z = self.forward_features(x, clinical_prior, lbls_diagnosis, lbls_change, mask)
+            x_rec = self.decoder(z)
+            return x_rec
+
+        # Classification
         features_diagnosis, features_change = self.forward_features(
             x, clinical_prior, lbls_diagnosis, lbls_change
         )
@@ -1005,126 +1134,300 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
         return flops
 
 
-def check_cuda_consistency(model, *inputs):
-    """检查模型和数据的CUDA设备一致性"""
-    model_device = next(model.parameters()).device
-
-    print(f"模型设备: {model_device}")
-
-    for i, data in enumerate(inputs):
-        if isinstance(data, torch.Tensor):
-            data_device = data.device
-            print(f"输入{i}设备: {data_device}")
-            assert model_device == data_device, f"设备不匹配: 模型在 {model_device}, 输入{i}在 {data_device}"
-        elif data is None:
-            print(f"输入{i}: None")
-        else:
-            print(f"输入{i}: 非tensor类型")
-
-
-# ===== 使用示例 =====
 if __name__ == "__main__":
-    # 确保使用CUDA
+    """测试不同的fusion stage和fusion type组合"""
+    import itertools
+    import torch
+
+    print("=" * 80)
+    print("Testing SwinTransformerV2_AlzheimerMMoE with different fusion configurations")
+    print("=" * 80)
+
+    # 测试配置
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+    batch_size = 2
+    img_size = 256
+    patch_size = 4
+    in_chans = 3
+    prior_dim = 3
 
-    # 创建模型并移动到GPU
-    model = SwinTransformerV2_AlzheimerMMoE(
-        img_size=256,
-        patch_size=4,
-        in_chans=3,
-        num_classes_diagnosis=3,
-        num_classes_change=3,
-        embed_dim=96,
-        depths=[2, 2, 6, 2],
-        num_heads=[3, 6, 12, 24],
-        window_size=16,
-        mlp_ratio=4.,
-        # 临床先验参数
-        use_clinical_prior=True,
-        prior_dim=3,
-        prior_hidden_dim=128,
-        fusion_stage=2,
-        fusion_type='adaptive'
-    ).to(device)
+    # 模型基础配置
+    base_config = {
+        'img_size': img_size,
+        'patch_size': patch_size,
+        'in_chans': in_chans,
+        'num_classes_diagnosis': 3,
+        'num_classes_change': 3,
+        'embed_dim': 96,
+        'depths': [2, 2, 6, 2],
+        'num_heads': [3, 6, 12, 24],
+        'window_size': 16,
+        'mlp_ratio': 4.,
+        'qkv_bias': True,
+        'drop_rate': 0.0,
+        'attn_drop_rate': 0.0,
+        'drop_path_rate': 0.1,
+        'ape': False,
+        'patch_norm': True,
+        'use_checkpoint': False,
+        'pretrained_window_sizes': [0, 0, 0, 0],
+        'is_pretrain': False,  # 测试时使用微调模式
+        'use_clinical_prior': True,
+        'prior_dim': prior_dim,
+        'prior_hidden_dim': 128,
+    }
 
-    # 测试输入并移动到GPU
-    batch_size = 4
-    img = torch.randn(batch_size, 3, 256, 256).to(device)
-    clinical_prior = torch.randn(batch_size, 3).to(device)
+    # 测试不同的fusion stage和type组合
+    fusion_stages = [0, 1, 2, 3]  # 4个stage
+    fusion_types = ['adaptive', 'concat', 'add', 'hadamard']
 
-    print("\n===== 设备一致性检查 =====")
-    check_cuda_consistency(model, img, clinical_prior)
+    # 准备测试数据
+    test_image = torch.randn(batch_size, in_chans, img_size, img_size).to(device)
+    test_prior = torch.randn(batch_size, prior_dim).to(device)
+    test_diag_labels = torch.randint(0, 3, (batch_size,)).to(device)
+    test_change_labels = torch.randint(0, 3, (batch_size,)).to(device)
 
-    print("\n===== 维度跟踪 =====")
-    print(f"输入图像形状: {img.shape}, 设备: {img.device}")
-    print(f"临床先验形状: {clinical_prior.shape}, 设备: {clinical_prior.device}")
+    print(f"\nTest data shapes:")
+    print(f"  Image: {test_image.shape}")
+    print(f"  Prior: {test_prior.shape}")
+    print(f"  Diagnosis labels: {test_diag_labels.shape}")
+    print(f"  Change labels: {test_change_labels.shape}")
 
-    # 测试临床编码器
-    fusion_dim = int(96 * 2 ** 2)  # Stage 2的特征维度 = 384
-    encoder = ClinicalPriorEncoder(prior_dim=3, output_dim=fusion_dim).to(device)
-    encoded_prior = encoder(clinical_prior)
-    print(f"\n编码后的临床特征形状: {encoded_prior.shape}, 设备: {encoded_prior.device}")
+    # 计算每个stage后的特征维度
+    embed_dim = base_config['embed_dim']
+    feature_dims = []
+    h, w = img_size // patch_size, img_size // patch_size  # Initial patch resolution
 
-    # 测试融合模块
-    test_image_features = torch.randn(batch_size, 256, fusion_dim).to(device)
-    print(f"\n图像特征形状 (Stage 2内): {test_image_features.shape}, 设备: {test_image_features.device}")
+    print(f"\nFeature dimensions at each stage:")
+    print(f"  Initial patches: {h} x {w}")
 
-    fusion = ClinicalImageFusion(image_dim=fusion_dim, clinical_dim=fusion_dim).to(device)
-    fused_features = fusion(test_image_features, encoded_prior)
-    print(f"融合后的特征形状: {fused_features.shape}, 设备: {fused_features.device}")
+    for i in range(4):
+        if i < 3:  # 前3个stage有PatchMerging
+            dim = int(embed_dim * 2 ** (i + 1))
+            h, w = h // 2, w // 2
+        else:  # 最后一个stage没有PatchMerging
+            dim = int(embed_dim * 2 ** i)
+        feature_dims.append((dim, h * w))
+        print(f"  Stage {i}: dim={dim}, spatial_size={h}x{w}, tokens={h * w}")
 
-    # 前向传播测试
-    print("\n===== 完整模型测试 =====")
+    print("\n" + "=" * 80)
+    print("Testing all fusion configurations:")
+    print("=" * 80)
 
-    # 使用临床先验
-    with torch.cuda.amp.autocast():  # 使用混合精度
-        diag_out, change_out = model(img, clinical_prior=clinical_prior)
+    success_count = 0
+    fail_count = 0
+    results = []
 
-    print(f"诊断输出形状: {diag_out.shape}, 设备: {diag_out.device}")
-    print(f"变化输出形状: {change_out.shape}, 设备: {change_out.device}")
+    for stage, ftype in itertools.product(fusion_stages, fusion_types):
+        config = base_config.copy()
+        config['fusion_stage'] = stage
+        config['fusion_type'] = ftype
 
-    # 不使用临床先验的情况
-    with torch.cuda.amp.autocast():
-        diag_out2, change_out2 = model(img, clinical_prior=None)
+        print(f"\n[Test {success_count + fail_count + 1}] Fusion Stage: {stage}, Fusion Type: {ftype}")
+        print(f"  Expected fusion dim: {feature_dims[stage][0]}")
+        print(f"  Expected tokens: {feature_dims[stage][1]}")
 
-    print(f"\n不使用临床先验:")
-    print(f"诊断输出形状: {diag_out2.shape}, 设备: {diag_out2.device}")
-    print(f"变化输出形状: {change_out2.shape}, 设备: {change_out2.device}")
+        try:
+            # 创建模型
+            model = SwinTransformerV2_AlzheimerMMoE(**config).to(device)
 
-    # GPU内存使用情况
+            # 测试前向传播
+            with torch.no_grad():
+                # 测试分类模式
+                diag_out, change_out = model(
+                    test_image,
+                    clinical_prior=test_prior,
+                    lbls_diagnosis=test_diag_labels,
+                    lbls_change=test_change_labels
+                )
+
+                # 测试SimMIM重建模式
+                mask = torch.randint(0, 2, (batch_size, (img_size // patch_size) ** 2)).float().to(device)
+                recon_out = model(
+                    test_image,
+                    clinical_prior=test_prior,
+                    lbls_diagnosis=test_diag_labels,
+                    lbls_change=test_change_labels,
+                    mask=mask
+                )
+
+            # 计算参数量
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+            print(f"  ✓ Success!")
+            print(f"    - Diagnosis output: {diag_out.shape}")
+            print(f"    - Change output: {change_out.shape}")
+            print(f"    - Reconstruction output: {recon_out.shape}")
+            print(f"    - Total params: {total_params:,}")
+            print(f"    - Trainable params: {trainable_params:,}")
+
+            # 检查融合模块的维度 - 修复这里
+            fusion_dim = feature_dims[stage][0]
+            # 获取MLP的最后一层来检查输出维度
+            last_layer = None
+            for layer in model.clinical_encoder.mlp:
+                if isinstance(layer, nn.Linear):
+                    last_layer = layer
+
+            if last_layer is not None:
+                print(f"    - Clinical encoder output dim: {last_layer.out_features}")
+            print(f"    - Fusion module input dim: {model.clinical_fusion.image_dim}")
+
+            success_count += 1
+            results.append({
+                'stage': stage,
+                'type': ftype,
+                'status': 'Success',
+                'params': total_params,
+                'diag_shape': diag_out.shape,
+                'change_shape': change_out.shape
+            })
+
+        except Exception as e:
+            print(f"  ✗ Failed!")
+            print(f"    Error: {str(e)}")
+            fail_count += 1
+            results.append({
+                'stage': stage,
+                'type': ftype,
+                'status': 'Failed',
+                'error': str(e)
+            })
+
+    # 打印总结
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+    print(f"Total tests: {len(results)}")
+    print(f"Successful: {success_count}")
+    print(f"Failed: {fail_count}")
+
+    if fail_count > 0:
+        print("\nFailed configurations:")
+        for r in results:
+            if r['status'] == 'Failed':
+                print(f"  - Stage {r['stage']}, Type {r['type']}: {r['error']}")
+
+    # 测试特定功能
+    print("\n" + "=" * 80)
+    print("ADDITIONAL FEATURE TESTS")
+    print("=" * 80)
+
+    # 测试不使用临床先验
+    print("\n1. Testing without clinical prior:")
+    config = base_config.copy()
+    config['use_clinical_prior'] = False
+    config['fusion_stage'] = 2
+    config['fusion_type'] = 'adaptive'
+
+    try:
+        model = SwinTransformerV2_AlzheimerMMoE(**config).to(device)
+        with torch.no_grad():
+            diag_out, change_out = model(
+                test_image,
+                clinical_prior=None,  # 不提供临床先验
+                lbls_diagnosis=test_diag_labels,
+                lbls_change=test_change_labels
+            )
+        print("  ✓ Success! Model works without clinical prior")
+        print(f"    - Diagnosis output: {diag_out.shape}")
+        print(f"    - Change output: {change_out.shape}")
+    except Exception as e:
+        print(f"  ✗ Failed: {str(e)}")
+
+    # 测试专家利用率分析
+    print("\n2. Testing expert utilization analysis:")
+    config = base_config.copy()
+    config['fusion_stage'] = 2
+    config['fusion_type'] = 'adaptive'
+
+    try:
+        model = SwinTransformerV2_AlzheimerMMoE(**config).to(device)
+        expert_weights = model.get_expert_utilization(
+            test_image,
+            clinical_prior=test_prior,
+            lbls_diagnosis=test_diag_labels,
+            lbls_change=test_change_labels
+        )
+        print(f"  ✓ Success! Got expert utilization data")
+        print(f"    - Number of layers with MMoE: {len(expert_weights)}")
+    except Exception as e:
+        print(f"  ✗ Failed: {str(e)}")
+
+    # 测试内存使用
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024 ** 3
-        cached = torch.cuda.memory_reserved() / 1024 ** 3
-        print(f"\nGPU内存使用:")
-        print(f"已分配: {allocated:.2f}GB")
-        print(f"缓存: {cached:.2f}GB")
+        print("\n3. Memory usage test:")
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
-    print("\n===== 模型参数统计 =====")
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"总参数量: {total_params:,}")
-    print(f"可训练参数量: {trainable_params:,}")
+        config = base_config.copy()
+        config['fusion_stage'] = 2
+        config['fusion_type'] = 'adaptive'
 
-    # 验证所有参数都在GPU上
-    params_on_cuda = all(p.device.type == 'cuda' for p in model.parameters())
-    print(f"所有参数都在CUDA上: {params_on_cuda}")
+        model = SwinTransformerV2_AlzheimerMMoE(**config).to(device)
 
-    print("\n===== 维度计算说明 (256x256输入) =====")
-    print("Swin Transformer维度变化:")
-    print(f"输入: 256x256")
-    print(f"Patch Embed后: 64x64, dim=96")
-    print(f"Stage 0: 64x64, dim=96 (融合点 fusion_stage=0)")
-    print(f"├─ 后接PatchMerging: 32x32, dim=192")
-    print(f"Stage 1: 32x32, dim=192 (融合点 fusion_stage=1)")
-    print(f"├─ 后接PatchMerging: 16x16, dim=384")
-    print(f"Stage 2: 16x16, dim=384 (融合点 fusion_stage=2)")
-    print(f"├─ 后接PatchMerging: 8x8, dim=768")
-    print(f"Stage 3: 8x8, dim=768 (融合点 fusion_stage=3)")
-    print(f"└─ 无PatchMerging，直接到分类头")
-    print(f"\n融合维度计算：embed_dim * 2^fusion_stage")
-    print(f"- fusion_stage=0: 96 * 2^0 = 96")
-    print(f"- fusion_stage=1: 96 * 2^1 = 192")
-    print(f"- fusion_stage=2: 96 * 2^2 = 384")
-    print(f"- fusion_stage=3: 96 * 2^3 = 768")
-    print(f"\nWindow size = 16, 在Stage 3时会自动调整为8以适应特征图大小")
+        # 测试更大的batch size
+        large_batch = 8
+        large_image = torch.randn(large_batch, in_chans, img_size, img_size).to(device)
+        large_prior = torch.randn(large_batch, prior_dim).to(device)
+
+        torch.cuda.synchronize()
+        start_mem = torch.cuda.memory_allocated() / 1024 ** 3  # GB
+
+        with torch.no_grad():
+            _ = model(large_image, clinical_prior=large_prior)
+
+        torch.cuda.synchronize()
+        end_mem = torch.cuda.memory_allocated() / 1024 ** 3  # GB
+
+        print(f"  ✓ Memory usage for batch size {large_batch}:")
+        print(f"    - Start: {start_mem:.2f} GB")
+        print(f"    - End: {end_mem:.2f} GB")
+        print(f"    - Increase: {end_mem - start_mem:.2f} GB")
+
+    # 测试每个stage的详细维度信息
+    # 测试每个stage的详细维度信息
+    print("\n4. Testing dimension consistency across stages:")
+    config = base_config.copy()
+    config['fusion_stage'] = 2
+    config['fusion_type'] = 'adaptive'
+
+    try:
+        model = SwinTransformerV2_AlzheimerMMoE(**config).to(device)
+        print("  ✓ Model architecture summary:")
+
+        # 检查每个stage的维度
+        for i, layer in enumerate(model.layers):
+            print(f"\n  Stage {i}:")
+            print(f"    - Dim: {layer.dim}")
+            print(f"    - Input resolution: {layer.input_resolution}")
+            print(f"    - Depth (blocks): {layer.depth}")
+            print(f"    - Has downsample: {layer.downsample is not None}")
+
+            # 检查是否是融合stage
+            if i == config['fusion_stage']:
+                print(f"    - *** This is the fusion stage ***")
+
+                # 修复：正确获取clinical encoder的输出维度
+                # 找到MLP中的最后一个Linear层
+                last_linear = None
+                for module in model.clinical_encoder.mlp.modules():
+                    if isinstance(module, nn.Linear):
+                        last_linear = module
+
+                if last_linear is not None:
+                    print(f"    - Clinical encoder output dim: {last_linear.out_features}")
+
+                # 计算融合后的维度
+                if i < len(model.layers) - 1:  # 不是最后一个stage
+                    fusion_dim = int(model.embed_dim * 2 ** (i + 1))
+                else:  # 最后一个stage
+                    fusion_dim = int(model.embed_dim * 2 ** i)
+                print(f"    - Expected fusion dim: {fusion_dim}")
+    except Exception as e:
+        print(f"  ✗ Failed: {str(e)}")
+
+    print("\n" + "=" * 80)
+    print("All tests completed!")
+    print("=" * 80)

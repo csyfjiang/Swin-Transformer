@@ -7,9 +7,11 @@ Version: 1.0
 """
 # !/usr/bin/env python
 """
-Alzheimer's Disease Dual-Task Classification Training Script
-- Diagnosis Task: CN(1), MCI(2), Dementia(3)
-- Change Task: Stable(1), Conversion(2), Reversion(3)
+Alzheimer's Disease Dual-Task Classification Training Script with SimMIM Pretraining
+- Pretrain Phase: SimMIM reconstruction task
+- Finetune Phase: Dual classification tasks
+  - Diagnosis Task: CN(1), MCI(2), Dementia(3)
+  - Change Task: Stable(1), Conversion(2), Reversion(3)
 """
 
 import argparse
@@ -55,11 +57,11 @@ PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
 
 def parse_args():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser('Alzheimer Dual-Task Classification Training')
+    parser = argparse.ArgumentParser('Alzheimer Dual-Task Classification Training with SimMIM Pretraining')
 
     # Basic settings
     parser.add_argument('--cfg', type=str,
-                        default='./configs/swin_admoe/swin_admoe_tiny_finetune_patch4_window16_256.yaml',
+                        default=r'D:\codebase\Swin-Transformer\configs\swin_admoe\swin_admoe_tiny_finetune_patch4_window16_256.yaml',
                         metavar="FILE",
                         help='path to config file')
     parser.add_argument('--opts', help="Modify config options by adding 'KEY VALUE' pairs",
@@ -90,7 +92,6 @@ def parse_args():
         # For PyTorch 2.x, make local_rank optional and default to 0
         parser.add_argument("--local_rank", type=int, default=0, help='local rank for distributed training')
 
-
     # Optimization settings
     parser.add_argument('--base-lr', type=float, help='base learning rate')
     parser.add_argument('--weight-decay', type=float, help='weight decay')
@@ -102,16 +103,29 @@ def parse_args():
     parser.add_argument('--disable-amp', action='store_true', help='Disable automatic mixed precision training')
 
     # WandB settings
-    parser.add_argument('--wandb-project', type=str, default='alzheimer-dual-task',
+    parser.add_argument('--wandb-project', type=str, default='alzheimer-simmim-dual-task',
                         help='wandb project name')
     parser.add_argument('--wandb-run-name', type=str, help='wandb run name')
     parser.add_argument('--wandb-offline', action='store_true', help='disable wandb online sync')
 
-    # Task weights
+    # Task weights (for finetuning phase)
     parser.add_argument('--weight-diagnosis', type=float, default=1.0,
                         help='weight for diagnosis task loss')
     parser.add_argument('--weight-change', type=float, default=1.0,
                         help='weight for change task loss')
+
+    # SimMIM specific settings
+    parser.add_argument('--mask-ratio', type=float, default=0.6,
+                        help='mask ratio for SimMIM pretraining')
+    parser.add_argument('--norm-target', action='store_true', default=True,
+                        help='normalize target for SimMIM')
+    parser.add_argument('--norm-target-patch-size', type=int, default=47,
+                        help='patch size for target normalization')
+
+    # Training phase control
+    parser.add_argument('--pretrain-epochs', type=int, help='number of pretraining epochs')
+    parser.add_argument('--skip-pretrain', action='store_true',
+                        help='skip pretraining phase and go directly to finetuning')
 
     args = parser.parse_args()
     return args
@@ -199,6 +213,32 @@ def prepare_config(args):
         config.TRAIN.AMP_ENABLE = False
         config.freeze()
 
+    # SimMIM specific overrides
+    if args.mask_ratio:
+        config.defrost()
+        config.MODEL.SIMMIM.MASK_RATIO = args.mask_ratio
+        config.freeze()
+
+    if args.norm_target is not None:
+        config.defrost()
+        config.MODEL.SIMMIM.NORM_TARGET.ENABLE = args.norm_target
+        config.freeze()
+
+    if args.norm_target_patch_size:
+        config.defrost()
+        config.MODEL.SIMMIM.NORM_TARGET.PATCH_SIZE = args.norm_target_patch_size
+        config.freeze()
+
+    if args.pretrain_epochs:
+        config.defrost()
+        config.TRAIN.PRETRAIN_EPOCHS = args.pretrain_epochs
+        config.freeze()
+
+    if args.skip_pretrain:
+        config.defrost()
+        config.TRAIN.PRETRAIN_EPOCHS = 0  # Skip pretraining
+        config.freeze()
+
     # Set output directory
     config.defrost()
     config.OUTPUT = args.output  # 只使用基础输出目录
@@ -259,9 +299,9 @@ def main():
         # Basic settings
         seed=config.SEED,
         output_dir=config.OUTPUT,
+        model_name=config.MODEL.NAME,
+        tag=config.TAG,
 
-        model_name=config.MODEL.NAME,  # 添加模型名称
-        tag=config.TAG,  # 添加实验标签
         # Data settings
         data_path=config.DATA.DATA_PATH,
         batch_size=config.DATA.BATCH_SIZE,
@@ -282,7 +322,7 @@ def main():
         weight_decay=config.TRAIN.WEIGHT_DECAY,
         label_smoothing=config.MODEL.LABEL_SMOOTHING,
 
-        # Task weights
+        # Task weights (for finetuning phase)
         weight_diagnosis=args.weight_diagnosis,
         weight_change=args.weight_change,
 
@@ -298,8 +338,12 @@ def main():
         warmup_epochs=getattr(config.TRAIN, 'WARMUP_EPOCHS', 5),
         warmup_lr=getattr(config.TRAIN, 'WARMUP_LR', 1e-6),
 
-        # 添加预训练轮数设置
+        # SimMIM预训练设置
         pretrain_epochs=getattr(config.TRAIN, 'PRETRAIN_EPOCHS', config.TRAIN.EPOCHS // 2),
+        mask_ratio=getattr(config.MODEL.SIMMIM, 'MASK_RATIO', 0.6),
+        patch_size=getattr(config.MODEL.SWIN_ADMOE, 'PATCH_SIZE', 4),
+        norm_target=getattr(config.MODEL.SIMMIM.NORM_TARGET, 'ENABLE', True),
+        norm_target_patch_size=getattr(config.MODEL.SIMMIM.NORM_TARGET, 'PATCH_SIZE', 47),
 
         # Config object
         config=config,
@@ -322,6 +366,11 @@ def main():
         checkpoint = torch.load(args.resume, map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         trainer_args.start_epoch = checkpoint['epoch'] + 1
+
+        # 检查是否有训练阶段信息
+        if 'phase' in checkpoint:
+            logger.info(f"Resumed from {checkpoint['phase']} phase")
+
         logger.info(f"Resumed from epoch {checkpoint['epoch']}")
     else:
         trainer_args.start_epoch = 0
@@ -331,6 +380,34 @@ def main():
         logger.info("Evaluation mode")
         # TODO: Implement evaluation function
         raise NotImplementedError("Evaluation mode not implemented yet")
+
+    # Log training plan
+    logger.info("\n" + "="*60)
+    logger.info("TRAINING PLAN")
+    logger.info("="*60)
+
+    pretrain_epochs = trainer_args.pretrain_epochs
+    total_epochs = trainer_args.max_epochs
+    finetune_epochs = total_epochs - pretrain_epochs
+
+    if pretrain_epochs > 0:
+        logger.info(f"Phase 1 - SimMIM Pretraining:")
+        logger.info(f"  Epochs: 0 - {pretrain_epochs-1} ({pretrain_epochs} epochs)")
+        logger.info(f"  Task: Self-supervised reconstruction")
+        logger.info(f"  Mask ratio: {trainer_args.mask_ratio}")
+        logger.info(f"  Expert assignment: Based on diagnosis labels")
+
+        logger.info(f"\nPhase 2 - Classification Finetuning:")
+        logger.info(f"  Epochs: {pretrain_epochs} - {total_epochs-1} ({finetune_epochs} epochs)")
+        logger.info(f"  Tasks: Diagnosis + Change classification")
+        logger.info(f"  Expert gating: Learned adaptive gating")
+    else:
+        logger.info(f"Single Phase - Classification Training:")
+        logger.info(f"  Epochs: 0 - {total_epochs-1} ({total_epochs} epochs)")
+        logger.info(f"  Tasks: Diagnosis + Change classification")
+        logger.info(f"  Note: Skipping SimMIM pretraining")
+
+    logger.info("="*60)
 
     # Start training
     logger.info("Start training")

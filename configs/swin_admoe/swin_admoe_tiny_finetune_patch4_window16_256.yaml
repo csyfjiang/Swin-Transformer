@@ -1,22 +1,29 @@
-# Alzheimer's Disease Dual-Task Classification Configuration
-# config/swin_admoe_tiny_256_finetune.yaml
+# Alzheimer's Disease Dual-Task Classification with SimMIM Pretraining Configuration
+# config/swin_admoe_tiny_simmim_patch4_window16_256.yaml
 
 DATA:
   DATASET: 'alzheimer'
-  DATA_PATH: 'Z://yufengjiang//data//slice'  # Windows path 'Z://yufengjiang//data//slice' 'D://codebase//Swin-Transformer//examples'
+  DATA_PATH: 'D://codebase//Swin-Transformer//examples'  # Windows path D://codebase//Swin-Transformer//examples Z://yufengjiang//data//slice
   IMG_SIZE: 256
-  BATCH_SIZE: 16
+  BATCH_SIZE: 8
   NUM_WORKERS: 4
   PIN_MEMORY: True
   INTERPOLATION: 'bicubic'
 
 MODEL:
   TYPE: swin_admoe
-  NAME: swin_admoe_tiny_finetune_patch4_window16_256
+  NAME: swin_admoe_tiny_simmim_patch4_window16_256
   NUM_CLASSES: 3  # Keep for compatibility
   DROP_RATE: 0.0
   DROP_PATH_RATE: 0.1
   LABEL_SMOOTHING: 0.1
+
+  # SimMIM Configuration
+  SIMMIM:
+    MASK_RATIO: 0.6  # Ratio of patches to mask
+    NORM_TARGET:
+      ENABLE: True   # Whether to normalize target
+      PATCH_SIZE: 47 # Patch size for target normalization
 
   SWIN_ADMOE:
     # Dual-task class numbers
@@ -29,28 +36,35 @@ MODEL:
     EMBED_DIM: 96
     DEPTHS: [2, 2, 6, 2]
     NUM_HEADS: [3, 6, 12, 24]
-    WINDOW_SIZE: 16
+    WINDOW_SIZE: 8
     MLP_RATIO: 4.0
     QKV_BIAS: True
     APE: False
     PATCH_NORM: True
-    PRETRAINED_WINDOW_SIZES: [12, 12, 12, 6]
+    PRETRAINED_WINDOW_SIZES: [8, 8, 8, 4]
     SHIFT_MLP_RATIO: 1.0
-    IS_PRETRAIN: False  # Fine-tuning stage, use learned gating
+    IS_PRETRAIN: True   # Start with pretraining mode
     USE_SHIFTED_LAST_LAYER: False
 
-# Data augmentation settings
+    # Clinical Prior Settings
+    USE_CLINICAL_PRIOR: True
+    PRIOR_DIM: 3
+    PRIOR_HIDDEN_DIM: 128
+    FUSION_STAGE: 2      # Fusion after stage 2
+    FUSION_TYPE: 'adaptive'  # 'adaptive', 'concat', 'add', 'hadamard'
+
+# Data augmentation settings (conservative for medical images)
 AUG:
   # Basic augmentation
   COLOR_JITTER: 0.0  # Medical images don't need color jitter
   AUTO_AUGMENT: 'none'  # Options: 'rand-m5-mstd0.5-inc1', 'none'
 
-  # Random Erasing
-  REPROB: 0.0  # Usually not used for medical images
+  # Random Erasing (disabled for medical images)
+  REPROB: 0.0
   REMODE: 'pixel'
   RECOUNT: 1
 
-  # Mixup/CutMix (use cautiously for medical images)
+  # Mixup/CutMix (disabled for medical images during pretraining)
   MIXUP: 0.0
   CUTMIX: 0.0
   CUTMIX_MINMAX: null
@@ -61,18 +75,18 @@ AUG:
 # Training settings
 TRAIN:
   START_EPOCH: 0
-  EPOCHS: 200
+  EPOCHS: 20
 
-  # Warmup settings
-  WARMUP_EPOCHS: 10      # warmup epochs
-  WARMUP_LR: 1e-6       # warmup learning rate
+  # Phase-specific settings
+  PRETRAIN_EPOCHS: 10  # First 100 epochs for SimMIM pretraining
 
   # Learning rate settings
-  BASE_LR: 1e-4         # base learning rate
-  MIN_LR: 1e-6          # minimum learning rate
+  BASE_LR: 1e-4         # Base learning rate
+  MIN_LR: 1e-6          # Minimum learning rate
 
-  # Pretrain settings
-  PRETRAIN_EPOCHS: 20   # Pretrain stage epochs
+  # Warmup settings
+  WARMUP_EPOCHS: 10     # Warmup epochs
+  WARMUP_LR: 1e-6       # Warmup learning rate
 
   # Weight decay and regularization
   WEIGHT_DECAY: 0.05
@@ -97,20 +111,20 @@ TRAIN:
     DECAY_RATE: 0.1
     WARMUP_PREFIX: True
 
-# Test settings (only use existing fields)
+# Test settings
 TEST:
-  CROP: False  # Medical images usually don't need cropping
+  CROP: False
   SEQUENTIAL: False
   SHUFFLE: False
 
-# AMP settings
+# Mixed precision training
 AMP_ENABLE: True
 
-# Other settings
+# Basic settings
 SEED: 42
-OUTPUT: './output/alzheimer_finetune'
-TAG: 'dual_task_v1'
-SAVE_FREQ: 10
+OUTPUT: './output/alzheimer_simmim_dual_task'
+TAG: 'simmim_pretrain_dual_task_v1'
+SAVE_FREQ: 20  # Save every 20 epochs
 PRINT_FREQ: 50
 EVAL_MODE: False
 THROUGHPUT_MODE: False
@@ -120,14 +134,13 @@ LOCAL_RANK: 0
 FUSED_WINDOW_PROCESS: False
 FUSED_LAYERNORM: False
 
-# Custom settings that need to be added to config.py
-# WandB settings (for trainer)
+# WandB settings
 WANDB:
-  PROJECT: 'alzheimer-dual-classification'
-  NAME: 'swin_admoe_finetune'
-  TAGS: ['dual-task', 'alzheimer', 'swin-admoe']
+  PROJECT: 'alzheimer-simmim-dual-classification'
+  NAME: 'swin_admoe_simmim_pretrain'
+  TAGS: ['simmim', 'dual-task', 'alzheimer', 'swin-admoe', 'pretraining']
 
-# Dual-task weight settings
+# Loss weights (for finetuning phase)
 LOSS:
   WEIGHT_DIAGNOSIS: 1.0  # Diagnosis task weight
   WEIGHT_CHANGE: 1.0     # Change task weight
@@ -141,5 +154,19 @@ EVAL:
 # Early stopping settings
 EARLY_STOP:
   ENABLE: True
-  PATIENCE: 5
-  MONITOR: 'val_loss'  # or 'val_acc_avg'
+  PATIENCE: 15   # Increased patience for pretraining
+  MONITOR: 'val_loss'  # For pretraining: reconstruction loss, for finetuning: classification loss
+
+# Phase-specific configurations
+PHASES:
+  PRETRAIN:
+    DESCRIPTION: "SimMIM self-supervised pretraining"
+    LOSS_TYPE: "reconstruction"
+    EXPERT_ASSIGNMENT: "label_based"  # Assign experts based on diagnosis labels
+    EVALUATION_METRIC: "reconstruction_loss"
+
+  FINETUNE:
+    DESCRIPTION: "Dual-task classification finetuning"
+    LOSS_TYPE: "classification"
+    EXPERT_ASSIGNMENT: "learned_gating"  # Use learned adaptive gating
+    EVALUATION_METRIC: "classification_accuracy"

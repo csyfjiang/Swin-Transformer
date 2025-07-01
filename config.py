@@ -141,6 +141,9 @@ _C.MODEL.SWIN_MLP.PATCH_NORM = True
 
 # [SimMIM] Norm target during training
 _C.MODEL.SIMMIM = CN()
+# Mask ratio for SimMIM pretraining
+_C.MODEL.SIMMIM.MASK_RATIO = 0.6
+# Normalization target settings
 _C.MODEL.SIMMIM.NORM_TARGET = CN()
 _C.MODEL.SIMMIM.NORM_TARGET.ENABLE = False
 _C.MODEL.SIMMIM.NORM_TARGET.PATCH_SIZE = 47
@@ -164,54 +167,12 @@ _C.MODEL.SWIN_ADMOE.USE_SHIFTED_LAST_LAYER = False
 # Dual-task specific parameters
 _C.MODEL.SWIN_ADMOE.NUM_CLASSES_DIAGNOSIS = 3
 _C.MODEL.SWIN_ADMOE.NUM_CLASSES_CHANGE = 3
-
-# Add these after the _C.TEST section
-
-# -----------------------------------------------------------------------------
-# Loss settings
-# -----------------------------------------------------------------------------
-_C.LOSS = CN()
-_C.LOSS.WEIGHT_DIAGNOSIS = 1.0
-_C.LOSS.WEIGHT_CHANGE = 1.0
-
-# -----------------------------------------------------------------------------
-# Evaluation settings
-# -----------------------------------------------------------------------------
-_C.EVAL = CN()
-_C.EVAL.INTERVAL = 10
-_C.EVAL.SAVE_BEST = True
-_C.EVAL.METRICS = ['accuracy', 'f1_score', 'confusion_matrix']
-
-# -----------------------------------------------------------------------------
-# Early stopping settings
-# -----------------------------------------------------------------------------
-_C.EARLY_STOP = CN()
-_C.EARLY_STOP.ENABLE = True
-_C.EARLY_STOP.PATIENCE = 5
-_C.EARLY_STOP.MONITOR = 'val_loss'
-
-# -----------------------------------------------------------------------------
-# WandB settings
-# -----------------------------------------------------------------------------
-_C.WANDB = CN()
-_C.WANDB.PROJECT = 'alzheimer-classification'
-_C.WANDB.NAME = 'experiment'
-_C.WANDB.TAGS = []
-
-# Add this in the _update_config_from_file function to handle encoding
-def _update_config_from_file(config, cfg_file):
-    config.defrost()
-    with open(cfg_file, 'r', encoding='utf-8') as f:  # Add encoding='utf-8'
-        yaml_cfg = yaml.load(f, Loader=yaml.FullLoader)
-
-    for cfg in yaml_cfg.setdefault('BASE', ['']):
-        if cfg:
-            _update_config_from_file(
-                config, os.path.join(os.path.dirname(cfg_file), cfg)
-            )
-    print('=> merge config from {}'.format(cfg_file))
-    config.merge_from_file(cfg_file)
-    config.freeze()
+# Clinical prior parameters
+_C.MODEL.SWIN_ADMOE.USE_CLINICAL_PRIOR = True
+_C.MODEL.SWIN_ADMOE.PRIOR_DIM = 3
+_C.MODEL.SWIN_ADMOE.PRIOR_HIDDEN_DIM = 128
+_C.MODEL.SWIN_ADMOE.FUSION_STAGE = 2
+_C.MODEL.SWIN_ADMOE.FUSION_TYPE = 'adaptive'
 
 # -----------------------------------------------------------------------------
 # Training settings
@@ -224,6 +185,7 @@ _C.TRAIN.WEIGHT_DECAY = 0.05
 _C.TRAIN.BASE_LR = 5e-4
 _C.TRAIN.WARMUP_LR = 5e-7
 _C.TRAIN.MIN_LR = 5e-6
+# Pretraining epochs for SimMIM
 _C.TRAIN.PRETRAIN_EPOCHS = 100
 # Clip gradient norm
 _C.TRAIN.CLIP_GRAD = 5.0
@@ -266,6 +228,7 @@ _C.TRAIN.LAYER_DECAY = 1.0
 _C.TRAIN.MOE = CN()
 # Only save model on master device
 _C.TRAIN.MOE.SAVE_MASTER = False
+
 # -----------------------------------------------------------------------------
 # Augmentation settings
 # -----------------------------------------------------------------------------
@@ -333,6 +296,23 @@ _C.WANDB = CN()
 _C.WANDB.PROJECT = 'alzheimer-classification'
 _C.WANDB.NAME = 'experiment'
 _C.WANDB.TAGS = []
+
+# -----------------------------------------------------------------------------
+# Phase-specific configurations
+# -----------------------------------------------------------------------------
+_C.PHASES = CN()
+_C.PHASES.PRETRAIN = CN()
+_C.PHASES.PRETRAIN.DESCRIPTION = "SimMIM self-supervised pretraining"
+_C.PHASES.PRETRAIN.LOSS_TYPE = "reconstruction"
+_C.PHASES.PRETRAIN.EXPERT_ASSIGNMENT = "label_based"
+_C.PHASES.PRETRAIN.EVALUATION_METRIC = "reconstruction_loss"
+
+_C.PHASES.FINETUNE = CN()
+_C.PHASES.FINETUNE.DESCRIPTION = "Dual-task classification finetuning"
+_C.PHASES.FINETUNE.LOSS_TYPE = "classification"
+_C.PHASES.FINETUNE.EXPERT_ASSIGNMENT = "learned_gating"
+_C.PHASES.FINETUNE.EVALUATION_METRIC = "classification_accuracy"
+
 # -----------------------------------------------------------------------------
 # Misc
 # -----------------------------------------------------------------------------
@@ -427,6 +407,16 @@ def update_config(config, args):
     if _check_args('enable_amp'):
         config.ENABLE_AMP = args.enable_amp
 
+    # SimMIM specific argument overrides
+    if hasattr(args, 'mask_ratio') and args.mask_ratio is not None:
+        config.MODEL.SIMMIM.MASK_RATIO = args.mask_ratio
+    if hasattr(args, 'norm_target') and args.norm_target is not None:
+        config.MODEL.SIMMIM.NORM_TARGET.ENABLE = args.norm_target
+    if hasattr(args, 'norm_target_patch_size') and args.norm_target_patch_size is not None:
+        config.MODEL.SIMMIM.NORM_TARGET.PATCH_SIZE = args.norm_target_patch_size
+    if hasattr(args, 'pretrain_epochs') and args.pretrain_epochs is not None:
+        config.TRAIN.PRETRAIN_EPOCHS = args.pretrain_epochs
+
     # for acceleration
     if _check_args('fused_window_process'):
         config.FUSED_WINDOW_PROCESS = True
@@ -441,7 +431,7 @@ def update_config(config, args):
         config.LOCAL_RANK = args.local_rank
     else:
         # For PyTorch 2.x, safely get LOCAL_RANK with fallback
-        config.LOCAL_RANK = int(os.environ.get('LOCAL_RANK', args.local_rank))
+        config.LOCAL_RANK = int(os.environ.get('LOCAL_RANK', getattr(args, 'local_rank', 0)))
 
     # output folder
     config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
