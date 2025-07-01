@@ -126,6 +126,8 @@ class AlzheimerMMoE(nn.Module):
             tuple: (diagnosis_output, change_output)
         """
         batch_size, seq_len, feature_dim = x.shape
+        device = x.device  # 获取输入tensor的设备
+        dtype = x.dtype  # 获取输入tensor的数据类型
 
         # 计算所有专家的输出
         expert_outputs = []
@@ -137,7 +139,8 @@ class AlzheimerMMoE(nn.Module):
         # === 诊断任务路由 ===
         if is_pretrain and lbls_diagnosis is not None:
             # 预训练阶段：基于诊断标签的先验路由
-            diagnosis_weights = torch.zeros(batch_size, seq_len, self.num_experts, device=x.device)
+            diagnosis_weights = torch.zeros(batch_size, seq_len, self.num_experts,
+                                            device=device, dtype=dtype)
             diagnosis_weights[:, :, 0] = 0.4  # shared expert权重
 
             # 根据诊断标签激活对应专家
@@ -157,7 +160,8 @@ class AlzheimerMMoE(nn.Module):
         # === 变化任务路由 ===
         if is_pretrain and lbls_change is not None:
             # 预训练阶段：基于变化标签的先验路由
-            change_weights = torch.zeros(batch_size, seq_len, self.num_experts, device=x.device)
+            change_weights = torch.zeros(batch_size, seq_len, self.num_experts,
+                                         device=device, dtype=dtype)
             change_weights[:, :, 0] = 0.4  # shared expert权重
 
             # 根据变化标签激活对应专家
@@ -291,8 +295,12 @@ class WindowAttention(nn.Module):
 
         # cosine attention
         attn = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1))
-        logit_scale = torch.clamp(self.logit_scale,
-                                  max=torch.log(torch.tensor(1. / 0.01, device=self.logit_scale.device))).exp()
+
+        # 修复：确保clamp操作中的tensor在同一设备上
+        logit_scale = torch.clamp(
+            self.logit_scale,
+            max=torch.log(torch.tensor(1. / 0.01, device=self.logit_scale.device, dtype=self.logit_scale.dtype))
+        ).exp()
         attn = attn * logit_scale
 
         relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
@@ -759,7 +767,6 @@ class ClinicalImageFusion(nn.Module):
         return self.dropout(fused)
 
 
-# ===== 修改SwinTransformerV2_AlzheimerMMoE以集成临床先验 =====
 class SwinTransformerV2_AlzheimerMMoE(nn.Module):
     """
     扩展版Swin Transformer V2 with Alzheimer MMoE
@@ -997,10 +1004,31 @@ class SwinTransformerV2_AlzheimerMMoE(nn.Module):
         flops += self.num_features * self.num_classes_change
         return flops
 
-# ===== 使用示例 =====
+
+def check_cuda_consistency(model, *inputs):
+    """检查模型和数据的CUDA设备一致性"""
+    model_device = next(model.parameters()).device
+
+    print(f"模型设备: {model_device}")
+
+    for i, data in enumerate(inputs):
+        if isinstance(data, torch.Tensor):
+            data_device = data.device
+            print(f"输入{i}设备: {data_device}")
+            assert model_device == data_device, f"设备不匹配: 模型在 {model_device}, 输入{i}在 {data_device}"
+        elif data is None:
+            print(f"输入{i}: None")
+        else:
+            print(f"输入{i}: 非tensor类型")
+
+
 # ===== 使用示例 =====
 if __name__ == "__main__":
-    # 创建模型
+    # 确保使用CUDA
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
+    # 创建模型并移动到GPU
     model = SwinTransformerV2_AlzheimerMMoE(
         img_size=256,
         patch_size=4,
@@ -1013,58 +1041,75 @@ if __name__ == "__main__":
         window_size=16,
         mlp_ratio=4.,
         # 临床先验参数
-        # 临床先验参数
-        use_clinical_prior=True,  # 是否使用临床先验信息 (True/False)
-        prior_dim=3,  # 临床先验向量维度 (根据实际数据调整，如3维概率分布)
-        prior_hidden_dim=128,  # MLP编码器的隐藏层维度 (建议: 64/128/256)
-        fusion_stage=2,  # 在哪个stage后融合 (0/1/2/3，推荐1或2，越深语义越丰富)
-        fusion_type='adaptive'  # 融合策略 ('adaptive'/'concat'/'add'/'hadamard')
-        # - 'adaptive': 学习自适应权重（推荐）
-        # - 'concat': 拼接后投影
-        # - 'add': 加权相加
-        # - 'hadamard': 逐元素乘积+残差
-    )
+        use_clinical_prior=True,
+        prior_dim=3,
+        prior_hidden_dim=128,
+        fusion_stage=2,
+        fusion_type='adaptive'
+    ).to(device)
 
-    # 测试输入
+    # 测试输入并移动到GPU
     batch_size = 4
-    img = torch.randn(batch_size, 3, 256, 256)
-    clinical_prior = torch.randn(batch_size, 3)  # 3维临床先验
+    img = torch.randn(batch_size, 3, 256, 256).to(device)
+    clinical_prior = torch.randn(batch_size, 3).to(device)
 
-    print("===== 维度跟踪 =====")
-    print(f"输入图像形状: {img.shape}")
-    print(f"临床先验形状: {clinical_prior.shape}")
+    print("\n===== 设备一致性检查 =====")
+    check_cuda_consistency(model, img, clinical_prior)
+
+    print("\n===== 维度跟踪 =====")
+    print(f"输入图像形状: {img.shape}, 设备: {img.device}")
+    print(f"临床先验形状: {clinical_prior.shape}, 设备: {clinical_prior.device}")
 
     # 测试临床编码器
-    # 融合发生在stage内部，所以维度是 96 * 2^fusion_stage
     fusion_dim = int(96 * 2 ** 2)  # Stage 2的特征维度 = 384
-    encoder = ClinicalPriorEncoder(prior_dim=3, output_dim=fusion_dim)
+    encoder = ClinicalPriorEncoder(prior_dim=3, output_dim=fusion_dim).to(device)
     encoded_prior = encoder(clinical_prior)
-    print(f"\n编码后的临床特征形状: {encoded_prior.shape}")  # [B, 384]
+    print(f"\n编码后的临床特征形状: {encoded_prior.shape}, 设备: {encoded_prior.device}")
 
     # 测试融合模块
-    # Stage 2的图像特征（downsample之前）
-    # 空间分辨率: 256/(4*2^2) = 256/16 = 16x16 = 256
-    test_image_features = torch.randn(batch_size, 256, fusion_dim)  # [B, L, C]
-    print(f"\n图像特征形状 (Stage 2内): {test_image_features.shape}")
+    test_image_features = torch.randn(batch_size, 256, fusion_dim).to(device)
+    print(f"\n图像特征形状 (Stage 2内): {test_image_features.shape}, 设备: {test_image_features.device}")
 
-    fusion = ClinicalImageFusion(image_dim=fusion_dim, clinical_dim=fusion_dim)
+    fusion = ClinicalImageFusion(image_dim=fusion_dim, clinical_dim=fusion_dim).to(device)
     fused_features = fusion(test_image_features, encoded_prior)
-    print(f"融合后的特征形状: {fused_features.shape}")  # [B, L, C]
+    print(f"融合后的特征形状: {fused_features.shape}, 设备: {fused_features.device}")
 
-    # 前向传播
+    # 前向传播测试
     print("\n===== 完整模型测试 =====")
-    diag_out, change_out = model(img, clinical_prior=clinical_prior)
 
-    print(f"诊断输出形状: {diag_out.shape}")
-    print(f"变化输出形状: {change_out.shape}")
+    # 使用临床先验
+    with torch.cuda.amp.autocast():  # 使用混合精度
+        diag_out, change_out = model(img, clinical_prior=clinical_prior)
+
+    print(f"诊断输出形状: {diag_out.shape}, 设备: {diag_out.device}")
+    print(f"变化输出形状: {change_out.shape}, 设备: {change_out.device}")
 
     # 不使用临床先验的情况
-    diag_out2, change_out2 = model(img, clinical_prior=None)
-    print(f"\n不使用临床先验:")
-    print(f"诊断输出形状: {diag_out2.shape}")
-    print(f"变化输出形状: {change_out2.shape}")
+    with torch.cuda.amp.autocast():
+        diag_out2, change_out2 = model(img, clinical_prior=None)
 
-    # 维度计算说明
+    print(f"\n不使用临床先验:")
+    print(f"诊断输出形状: {diag_out2.shape}, 设备: {diag_out2.device}")
+    print(f"变化输出形状: {change_out2.shape}, 设备: {change_out2.device}")
+
+    # GPU内存使用情况
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        cached = torch.cuda.memory_reserved() / 1024 ** 3
+        print(f"\nGPU内存使用:")
+        print(f"已分配: {allocated:.2f}GB")
+        print(f"缓存: {cached:.2f}GB")
+
+    print("\n===== 模型参数统计 =====")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"总参数量: {total_params:,}")
+    print(f"可训练参数量: {trainable_params:,}")
+
+    # 验证所有参数都在GPU上
+    params_on_cuda = all(p.device.type == 'cuda' for p in model.parameters())
+    print(f"所有参数都在CUDA上: {params_on_cuda}")
+
     print("\n===== 维度计算说明 (256x256输入) =====")
     print("Swin Transformer维度变化:")
     print(f"输入: 256x256")
