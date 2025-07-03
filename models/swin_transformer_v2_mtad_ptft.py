@@ -119,13 +119,19 @@ class AlzheimerMMoE(nn.Module):
         """
         Args:
             x: 输入特征 [B, L, dim]
-            lbls_diagnosis: 诊断标签 [B] (0: CN, 1: MCI, 2: AD)
-            lbls_change: 变化标签 [B] (0: Stable, 1: Conversion, 2: Reversion)
+            lbls_diagnosis: 诊断标签 [B] (1: CN, 2: MCI, 3: AD)
+            lbls_change: 变化标签 [B] (1: Stable, 2: Conversion, 3: Reversion)
             is_pretrain: 是否为预训练阶段
             temperature: softmax温度参数
             task: 'both', 'diagnosis', 'change', or 'reconstruction' (for SimMIM)
         Returns:
             tuple: (diagnosis_output, change_output) or single output for reconstruction
+
+        专家索引定义：
+            - 专家0: Shared expert (通用专家)
+            - 专家1: CN-focused expert (对应诊断标签1)
+            - 专家2: MCI-focused expert (对应诊断标签2)
+            - 专家3: AD-focused expert (对应诊断标签3)
         """
         batch_size, seq_len, feature_dim = x.shape
         device = x.device
@@ -138,23 +144,22 @@ class AlzheimerMMoE(nn.Module):
             expert_outputs.append(expert_output)
         expert_outputs = torch.stack(expert_outputs, dim=-1)  # [B, L, dim, num_experts]
 
-        # For SimMIM reconstruction task - 只根据诊断标签分配专家
+        # ===== SimMIM重建任务 =====
         if task == 'reconstruction':
-            # 在重建任务中，只根据诊断标签选择专家
             if lbls_diagnosis is not None:
                 # 基于诊断标签的专家选择
                 reconstruction_weights = torch.zeros(batch_size, seq_len, self.num_experts,
                                                      device=device, dtype=dtype)
-                reconstruction_weights[:, :, 0] = 0.4  # shared expert始终保持40%权重
+                reconstruction_weights[:, :, 0] = 0.4  # shared expert保持40%权重
 
-                # 根据诊断标签激活对应专家（60%权重）
+                # 直接对应：标签值 -> 专家索引
                 for i, lbl in enumerate(lbls_diagnosis):
-                    if lbl == 2:  # AD
-                        reconstruction_weights[i, :, 1] = 0.6  # AD-focused expert
-                    elif lbl == 1:  # MCI
-                        reconstruction_weights[i, :, 2] = 0.6  # MCI-focused expert
-                    elif lbl == 0:  # CN
-                        reconstruction_weights[i, :, 3] = 0.6  # CN-focused expert
+                    if lbl == 1:  # CN -> CN专家(索引1)
+                        reconstruction_weights[i, :, 1] = 0.6
+                    elif lbl == 2:  # MCI -> MCI专家(索引2)
+                        reconstruction_weights[i, :, 2] = 0.6
+                    elif lbl == 3:  # AD -> AD专家(索引3)
+                        reconstruction_weights[i, :, 3] = 0.6
             else:
                 # 没有标签时，平均使用所有专家
                 reconstruction_weights = torch.ones(batch_size, seq_len, self.num_experts,
@@ -163,24 +168,24 @@ class AlzheimerMMoE(nn.Module):
             # 计算重建输出
             reconstruction_weights_expanded = reconstruction_weights.unsqueeze(2)  # [B, L, 1, num_experts]
             reconstruction_output = torch.sum(expert_outputs * reconstruction_weights_expanded, dim=-1)  # [B, L, dim]
-
             return reconstruction_output
 
-        # Original dual-task logic
-        # === 诊断任务路由 ===
+        # ===== 双任务分类模式 =====
+
+        # === 诊断任务专家路由 ===
         if is_pretrain and lbls_diagnosis is not None:
-            # 预训练阶段：基于诊断标签的先验路由
+            # 预训练阶段：基于标签的先验路由
             diagnosis_weights = torch.zeros(batch_size, seq_len, self.num_experts,
                                             device=device, dtype=dtype)
             diagnosis_weights[:, :, 0] = 0.4  # shared expert权重
 
-            # 根据诊断标签激活对应专家
+            # 直接对应：标签值 -> 专家索引
             for i, lbl in enumerate(lbls_diagnosis):
-                if lbl == 2:  # AD
+                if lbl == 1:  # CN -> CN专家(索引1)
                     diagnosis_weights[i, :, 1] = 0.6
-                elif lbl == 1:  # MCI
+                elif lbl == 2:  # MCI -> MCI专家(索引2)
                     diagnosis_weights[i, :, 2] = 0.6
-                elif lbl == 0:  # CN
+                elif lbl == 3:  # AD -> AD专家(索引3)
                     diagnosis_weights[i, :, 3] = 0.6
         else:
             # 微调阶段：使用学习的门控网络
@@ -188,38 +193,42 @@ class AlzheimerMMoE(nn.Module):
             diagnosis_gate_logits = self.diagnosis_gate(diagnosis_transformed_x)
             diagnosis_weights = F.softmax(diagnosis_gate_logits / temperature, dim=-1)
 
-        # === 变化任务路由 ===
+        # === 变化任务专家路由 ===
         if is_pretrain and lbls_change is not None:
-            # 预训练阶段：基于变化标签的先验路由
+            # 预训练阶段：基于标签的先验路由
             change_weights = torch.zeros(batch_size, seq_len, self.num_experts,
                                          device=device, dtype=dtype)
             change_weights[:, :, 0] = 0.4  # shared expert权重
 
-            # 根据变化标签激活对应专家
             for i, lbl in enumerate(lbls_change):
-                if lbl == 2:  # Reversion (认知改善)
-                    change_weights[i, :, 3] = 0.6  # 倾向于使用CN专家
-                elif lbl == 1:  # Conversion (认知恶化)
-                    change_weights[i, :, 1] = 0.6  # 倾向于使用AD专家
-                elif lbl == 0:  # Stable (稳定)
-                    # 根据当前诊断状态决定
+                if lbl == 1:  # Stable (稳定)
+                    # 根据当前诊断状态选择对应专家
                     if lbls_diagnosis is not None:
-                        if lbls_diagnosis[i] == 2:  # 当前AD，稳定
+                        current_diag = lbls_diagnosis[i]
+                        if current_diag == 1:  # 当前CN，稳定 -> CN专家
                             change_weights[i, :, 1] = 0.6
-                        elif lbls_diagnosis[i] == 1:  # 当前MCI，稳定
+                        elif current_diag == 2:  # 当前MCI，稳定 -> MCI专家
                             change_weights[i, :, 2] = 0.6
-                        elif lbls_diagnosis[i] == 0:  # 当前CN，稳定
+                        elif current_diag == 3:  # 当前AD，稳定 -> AD专家
                             change_weights[i, :, 3] = 0.6
                     else:
-                        # 如果没有诊断标签，平均分配给所有专家
+                        # 没有诊断标签时，平均分配给任务专家
                         change_weights[i, :, 1:] = 0.2
+
+                elif lbl == 2:  # Conversion (认知恶化)
+                    # 认知恶化倾向于AD专家
+                    change_weights[i, :, 3] = 0.6
+
+                elif lbl == 3:  # Reversion (认知改善)
+                    # 认知改善倾向于CN专家
+                    change_weights[i, :, 1] = 0.6
         else:
             # 微调阶段：使用学习的门控网络
             change_transformed_x = self.change_transform(x)
             change_gate_logits = self.change_gate(change_transformed_x)
             change_weights = F.softmax(change_gate_logits / temperature, dim=-1)
 
-        # 计算任务特定的专家输出加权组合
+        # === 计算任务特定输出 ===
         # 诊断任务输出
         diagnosis_weights_expanded = diagnosis_weights.unsqueeze(2)  # [B, L, 1, num_experts]
         diagnosis_output = torch.sum(expert_outputs * diagnosis_weights_expanded, dim=-1)  # [B, L, dim]
@@ -437,6 +446,10 @@ class SwinTransformerBlock_ADMMoE(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x, lbls_diagnosis=None, lbls_change=None, task='both'):
+
+        """
+        Pre-norm Swin Transformer Block with Alzheimer MMoE and SimMIM support.
+        """
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"

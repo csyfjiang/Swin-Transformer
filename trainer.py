@@ -479,8 +479,8 @@ def log_expert_utilization(model, val_loader, device, epoch):
             expert_utilization = model.get_expert_utilization(
                 images,
                 clinical_prior=clinical_priors,  # 新增：传入clinical prior
-                lbls_diagnosis=diagnosis_labels-1,
-                lbls_change=change_labels-1
+                lbls_diagnosis=diagnosis_labels,
+                lbls_change=change_labels
             )
 
             if expert_utilization:
@@ -761,8 +761,8 @@ def validate_finetune(model, val_loader, criterion, device, epoch, position=2):
         outputs = model(
             images,
             clinical_prior=clinical_priors,
-            lbls_diagnosis=diagnosis_labels-1,
-            lbls_change=change_labels-1
+            lbls_diagnosis=diagnosis_labels,
+            lbls_change=change_labels
         )
 
         # 计算损失
