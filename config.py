@@ -24,6 +24,8 @@ _C.BASE = ['']
 _C.DATA = CN()
 # Batch size for a single GPU, could be overwritten by command line argument
 _C.DATA.BATCH_SIZE = 128
+_C.DATA.BATCH_SIZE_PRETRAIN = 256   # 预训练阶段batch size
+_C.DATA.BATCH_SIZE_FINETUNE = 224   # 微调阶段batch size
 # Path to dataset, could be overwritten by command line argument
 _C.DATA.DATA_PATH = ''
 # Dataset name
@@ -79,7 +81,7 @@ _C.MODEL.SWIN.NUM_HEADS = [3, 6, 12, 24]
 _C.MODEL.SWIN.WINDOW_SIZE = 7
 _C.MODEL.SWIN.MLP_RATIO = 4.
 _C.MODEL.SWIN.QKV_BIAS = True
-_C.MODEL.SWIN.QK_SCALE = None
+_C.MODEL.SWIN.QK_SCALE = 0
 _C.MODEL.SWIN.APE = False
 _C.MODEL.SWIN.PATCH_NORM = True
 
@@ -107,7 +109,7 @@ _C.MODEL.SWIN_MOE.NUM_HEADS = [3, 6, 12, 24]
 _C.MODEL.SWIN_MOE.WINDOW_SIZE = 7
 _C.MODEL.SWIN_MOE.MLP_RATIO = 4.
 _C.MODEL.SWIN_MOE.QKV_BIAS = True
-_C.MODEL.SWIN_MOE.QK_SCALE = None
+_C.MODEL.SWIN_MOE.QK_SCALE = 0
 _C.MODEL.SWIN_MOE.APE = False
 _C.MODEL.SWIN_MOE.PATCH_NORM = True
 _C.MODEL.SWIN_MOE.MLP_FC2_BIAS = True
@@ -248,7 +250,7 @@ _C.AUG.MIXUP = 0.8
 # Cutmix alpha, cutmix enabled if > 0
 _C.AUG.CUTMIX = 1.0
 # Cutmix min/max ratio, overrides alpha and enables cutmix if set
-_C.AUG.CUTMIX_MINMAX = None
+_C.AUG.CUTMIX_MINMAX = (0.0, 1.0)
 # Probability of performing mixup or cutmix when either/both is enabled
 _C.AUG.MIXUP_PROB = 1.0
 # Probability of switching to cutmix when both mixup and cutmix enabled

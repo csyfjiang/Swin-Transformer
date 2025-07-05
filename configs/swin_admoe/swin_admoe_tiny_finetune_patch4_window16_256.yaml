@@ -3,12 +3,15 @@
 
 DATA:
   DATASET: 'alzheimer'
-  DATA_PATH: 'D://codebase//Swin-Transformer//examples'  # Windows path D://codebase//Swin-Transformer//examples Z://yufengjiang//data//slice
+  DATA_PATH: '../data/slice'  # Windows path D://codebase//Swin-Transformer//examples Z://yufengjiang//data//slice data/external_slices_for_pt_ft
   IMG_SIZE: 256
-  BATCH_SIZE: 8
+  BATCH_SIZE: 224
   NUM_WORKERS: 4
   PIN_MEMORY: True
   INTERPOLATION: 'bicubic'
+  # 添加阶段特定的batch size
+  BATCH_SIZE_PRETRAIN: 384  # 预训练阶段的batch size
+  BATCH_SIZE_FINETUNE: 224  # 微调阶段的batch size
 
 MODEL:
   TYPE: swin_admoe
@@ -27,9 +30,11 @@ MODEL:
 
   SWIN_ADMOE:
     # Dual-task class numbers
-    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3)
+    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3) for 3 classes, CN(0), AD(1) for 2 classes
     NUM_CLASSES_CHANGE: 3     # Stable(1), Conversion(2), Reversion(3)
-
+    # Label availability settings
+    # DIAGNOSIS_LABEL_AVAILABLE: True   # Whether diagnosis labels are available
+    # CHANGE_LABEL_AVAILABLE: False
     # Model architecture parameters
     PATCH_SIZE: 4
     IN_CHANS: 3
@@ -57,7 +62,7 @@ MODEL:
 AUG:
   # Basic augmentation
   COLOR_JITTER: 0.0  # Medical images don't need color jitter
-  AUTO_AUGMENT: 'none'  # Options: 'rand-m5-mstd0.5-inc1', 'none'
+  AUTO_AUGMENT: 'rand-m5-mstd0.5-inc1'  # Options: 'rand-m5-mstd0.5-inc1', 'none'
 
   # Random Erasing (disabled for medical images)
   REPROB: 0.0
@@ -67,7 +72,7 @@ AUG:
   # Mixup/CutMix (disabled for medical images during pretraining)
   MIXUP: 0.0
   CUTMIX: 0.0
-  CUTMIX_MINMAX: null
+  CUTMIX_MINMAX: [0.3,0.7]
   MIXUP_PROB: 0.0
   MIXUP_SWITCH_PROB: 0.5
   MIXUP_MODE: 'batch'
@@ -75,10 +80,10 @@ AUG:
 # Training settings
 TRAIN:
   START_EPOCH: 0
-  EPOCHS: 20
+  EPOCHS: 200
 
   # Phase-specific settings
-  PRETRAIN_EPOCHS: 10  # First 100 epochs for SimMIM pretraining
+  PRETRAIN_EPOCHS: 50  # First 100 epochs for SimMIM pretraining
 
   # Learning rate settings
   BASE_LR: 1e-4         # Base learning rate
@@ -147,14 +152,14 @@ LOSS:
 
 # Evaluation settings
 EVAL:
-  INTERVAL: 10  # Validate every 10 epochs
+  INTERVAL: 25  # Validate every 10 epochs
   SAVE_BEST: True
   METRICS: ['accuracy', 'f1_score', 'confusion_matrix']
 
 # Early stopping settings
 EARLY_STOP:
   ENABLE: True
-  PATIENCE: 15   # Increased patience for pretraining
+  PATIENCE: 5   # Increased patience for pretraining
   MONITOR: 'val_loss'  # For pretraining: reconstruction loss, for finetuning: classification loss
 
 # Phase-specific configurations
