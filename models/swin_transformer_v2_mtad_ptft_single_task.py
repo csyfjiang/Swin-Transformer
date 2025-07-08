@@ -93,7 +93,7 @@ class FeatureLevelAttention(nn.Module):
 
 
 class AlzheimerMMoE_SingleTask(nn.Module):
-    """Single Task Mixture of Experts for Alzheimer Disease Analysis - Degraded Version"""
+    """Single Task Mixture of Experts for Alzheimer Disease Analysis - Fixed Version"""
 
     def __init__(self, dim, hidden_dim, num_classes=2, act_layer=nn.GELU, drop=0.):
         """
@@ -116,7 +116,7 @@ class AlzheimerMMoE_SingleTask(nn.Module):
         elif num_classes == 3:
             # 三分类：1个shared + 3个类别特定专家 = 4个专家
             self.num_experts = 4
-            self.expert_names = ['Shared', 'Class_1', 'Class_2', 'Class_3']
+            self.expert_names = ['Shared', 'Class_0', 'Class_1', 'Class_2']
         else:
             # 多分类：1个shared + num_classes个类别特定专家
             self.num_experts = num_classes + 1
@@ -139,7 +139,7 @@ class AlzheimerMMoE_SingleTask(nn.Module):
         """
         Args:
             x: 输入特征 [B, L, dim]
-            labels: 分类标签 [B] (0-based indexing)
+            labels: 分类标签 [B] (MUST be 0-based indexing: 0, 1, 2, ...)
             is_pretrain: 是否为预训练阶段
             temperature: softmax温度参数
             task: 'classification' or 'reconstruction' (for SimMIM)
@@ -165,21 +165,21 @@ class AlzheimerMMoE_SingleTask(nn.Module):
                                                      device=device, dtype=dtype)
                 reconstruction_weights[:, :, 0] = 0.4  # shared expert保持40%权重
 
-                # 根据标签分配专家权重
+                # 根据标签分配专家权重 - 假设labels已经是0-based
                 for i, lbl in enumerate(labels):
-                    if self.num_classes == 2:
-                        # 二分类：标签0->专家1, 标签1->专家2
-                        expert_idx = lbl.item() + 1
-                        reconstruction_weights[i, :, expert_idx] = 0.6
-                    elif self.num_classes == 3:
-                        # 三分类：标签0->专家1, 标签1->专家2, 标签2->专家3
-                        expert_idx = lbl.item() + 1
-                        reconstruction_weights[i, :, expert_idx] = 0.6
-                    else:
-                        # 多分类：标签i->专家i+1
-                        expert_idx = lbl.item() + 1
+                    label_val = lbl.item() if hasattr(lbl, 'item') else lbl
+
+                    # 安全检查：确保标签在有效范围内
+                    if 0 <= label_val < self.num_classes:
+                        # 0-based label直接映射到对应专家：label -> expert_index = label + 1
+                        expert_idx = label_val + 1
                         if expert_idx < self.num_experts:
                             reconstruction_weights[i, :, expert_idx] = 0.6
+                    else:
+                        # 如果标签无效，使用平均权重
+                        print(
+                            f"Warning: Invalid label {label_val} for {self.num_classes} classes. Using uniform weights.")
+                        reconstruction_weights[i, :, :] = 1.0 / self.num_experts
             else:
                 # 没有标签时，平均使用所有专家
                 reconstruction_weights = torch.ones(batch_size, seq_len, self.num_experts,
@@ -197,21 +197,20 @@ class AlzheimerMMoE_SingleTask(nn.Module):
                                        device=device, dtype=dtype)
             task_weights[:, :, 0] = 0.4  # shared expert权重
 
-            # 根据标签分配专家权重
+            # 根据标签分配专家权重 - 假设labels已经是0-based
             for i, lbl in enumerate(labels):
-                if self.num_classes == 2:
-                    # 二分类：标签0->专家1, 标签1->专家2
-                    expert_idx = lbl.item() + 1
-                    task_weights[i, :, expert_idx] = 0.6
-                elif self.num_classes == 3:
-                    # 三分类：标签0->专家1, 标签1->专家2, 标签2->专家3
-                    expert_idx = lbl.item() + 1
-                    task_weights[i, :, expert_idx] = 0.6
-                else:
-                    # 多分类：标签i->专家i+1
-                    expert_idx = lbl.item() + 1
+                label_val = lbl.item() if hasattr(lbl, 'item') else lbl
+
+                # 安全检查：确保标签在有效范围内
+                if 0 <= label_val < self.num_classes:
+                    # 0-based label直接映射到对应专家：label -> expert_index = label + 1
+                    expert_idx = label_val + 1
                     if expert_idx < self.num_experts:
                         task_weights[i, :, expert_idx] = 0.6
+                else:
+                    # 如果标签无效，使用平均权重
+                    print(f"Warning: Invalid label {label_val} for {self.num_classes} classes. Using uniform weights.")
+                    task_weights[i, :, :] = 1.0 / self.num_experts
         else:
             # 微调阶段：使用学习的门控网络
             task_transformed_x = self.task_transform(x)

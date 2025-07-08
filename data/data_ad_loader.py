@@ -247,50 +247,61 @@ class AlzheimerTransform(object):
 def build_dataset(is_train, config):
     """构建数据集"""
 
-    # ===== 配置数据增强 =====
+    # 配置数据增强
     transform = AlzheimerTransform(
         output_size=(config.DATA.IMG_SIZE, config.DATA.IMG_SIZE),
         is_train=is_train,
-        # 数据增强设置
-        use_rotation=True,  # 保留旋转
-        use_crop=True,  # 保留裁剪
-        print_stats=False  # 不打印统计信息
+        use_rotation=True,
+        use_crop=True,
+        print_stats=False
     )
 
     if config.DATA.DATASET == 'alzheimer':
         # 设置数据目录
-        if is_train:
-            data_dir = os.path.join(config.DATA.DATA_PATH, 'train')
-            if not os.path.exists(data_dir):
-                data_dir = config.DATA.DATA_PATH
-        else:
-            data_dir = os.path.join(config.DATA.DATA_PATH, 'val')
-            if not os.path.exists(data_dir):
-                data_dir = config.DATA.DATA_PATH
+        data_path = config.DATA.DATA_PATH
 
-        # 如果只有一个目录，则分割数据
-        if data_dir == config.DATA.DATA_PATH:
-            all_files = glob.glob(os.path.join(data_dir, '*.npz'))
-            all_files = [os.path.basename(f) for f in all_files]
-            random.shuffle(all_files)
+        # 检查是否有train/test子目录
+        train_dir = os.path.join(data_path, 'train')
+        test_dir = os.path.join(data_path, 'test')
 
-            split_idx = int(0.8 * len(all_files))
+        if os.path.exists(train_dir) and os.path.exists(test_dir):
+            # 有子目录结构
             if is_train:
-                file_list = all_files[:split_idx]
+                data_dir = train_dir
             else:
-                file_list = all_files[split_idx:]
+                data_dir = test_dir
 
             dataset = AlzheimerNPZDataset(
                 data_dir=data_dir,
                 split='train' if is_train else 'val',
                 transform=transform
             )
-            dataset.files = file_list
         else:
+            # 没有子目录，需要手动分割
+            all_files = glob.glob(os.path.join(data_path, '*.npz'))
+            if not all_files:
+                raise ValueError(f"No NPZ files found in {data_path}")
+
+            # 打印找到的文件数量
+            print(f"Found {len(all_files)} NPZ files in {data_path}")
+
+            # 随机打乱并分割
+            random.shuffle(all_files)
+            split_idx = int(0.8 * len(all_files))
+
+            if is_train:
+                file_list = all_files[:split_idx]
+            else:
+                file_list = all_files[split_idx:]
+
+            print(f"{'Train' if is_train else 'Val'} set: {len(file_list)} files")
+
+            # 创建数据集并设置文件列表
             dataset = AlzheimerNPZDataset(
-                data_dir=data_dir,
+                data_dir=data_path,
                 split='train' if is_train else 'val',
-                transform=transform
+                transform=transform,
+                file_list=file_list  # 传入文件列表
             )
 
         # 设置类别数
