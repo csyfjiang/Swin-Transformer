@@ -28,7 +28,7 @@ from config import get_config
 from models import build_model
 from trainer import trainer_alzheimer_mmoe
 from logger import create_logger
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import warnings
 import logging
 # 忽略特定的警告信息
@@ -59,9 +59,9 @@ def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser('Alzheimer Dual-Task Classification Training with SimMIM Pretraining')
 
-    # Basic settings
+    # Basic settings configs/swin_admoe/swin_admoe_tiny_finetune_patch4_window16_256.yaml
     parser.add_argument('--cfg', type=str,
-                        default=r'configs/swin_admoe/swin_admoe_tiny_finetune_patch4_window16_256.yaml',
+                        default=r'D:\codebase\Swin-Transformer\configs\swin_admoe\swin_admoe_tiny_finetune_patch4_window16_256.yaml',
                         metavar="FILE",
                         help='path to config file')
     parser.add_argument('--opts', help="Modify config options by adding 'KEY VALUE' pairs",

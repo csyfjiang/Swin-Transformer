@@ -1,25 +1,24 @@
 """
 Description: 
 Author: JeffreyJ
-Date: 2025/7/5
-LastEditTime: 2025/7/5 14:36
-Version: 1.0
-"""
-"""
-Description: Single Task Trainer for Alzheimer's Disease Classification
-Author: JeffreyJ
 Date: 2025/6/25
 LastEditTime: 2025/6/25 14:01
-Version: 2.0 - Single Task Degraded Version
+Version: 2.0 - Nine Label Version
 """
 """
-阿尔兹海默症单任务分类训练器 - 退化版本 + SimMIM预训练
+阿尔兹海默症双任务分类训练器 - MMoE版本 + SimMIM预训练 - 7分类Change Label版本
 - 预训练阶段：使用SimMIM进行自监督重建任务
-- 微调阶段：支持单个分类任务
-  - Binary: CN vs AD (0, 1)
-  - Three-class: CN, MCI, AD (0, 1, 2)
-  - Custom: 任意类别数
-- 使用单任务MoE架构，专家分配基于类别
+- 微调阶段：支持两个分类任务
+  - Diagnosis (1=CN, 2=MCI, 3=Dementia)
+  - Change Label (1-7: 细化的转换类型)
+    1: Stable CN to CN
+    2: Stable MCI to MCI  
+    3: Stable AD to AD
+    4: Conversion CN to MCI
+    5: Conversion MCI to AD
+    6: Conversion CN to AD
+    7: Reversion MCI to CN
+- 使用8专家MMoE架构，分别的门控网络
 - 使用wandb记录训练过程
 - 包含早停机制
 - 智能权重管理：预训练后自动移除decoder
@@ -37,10 +36,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
 from tqdm import tqdm
 import wandb
 import matplotlib.pyplot as plt
+import seaborn as sns
 import math
 
 import logging
@@ -201,7 +201,7 @@ def remove_decoder_from_model(model, logger=None):
 
     # 获取移除后的参数统计
     total_params_after = sum(p.numel() for p in model.parameters())
-    memory_saved = decoder_params * 4 / (1024 ** 2)  # 假设float32，转换为MB
+    memory_saved = decoder_params * 4 / (1024**2)  # 假设float32，转换为MB
 
     logger.info(f"Parameter statistics:")
     logger.info(f"  - Before: {total_params_before:,} parameters")
@@ -233,9 +233,9 @@ def log_model_components(model, phase="unknown", logger=None):
     if logger is None:
         logger = logging.getLogger()
 
-    logger.info(f"\n{'=' * 50}")
+    logger.info(f"\n{'='*50}")
     logger.info(f"MODEL COMPONENTS ANALYSIS - {phase.upper()}")
-    logger.info(f"{'=' * 50}")
+    logger.info(f"{'='*50}")
 
     model_to_check = model.module if hasattr(model, 'module') else model
 
@@ -248,18 +248,18 @@ def log_model_components(model, phase="unknown", logger=None):
             components[name] = param_count
 
             # 特别标注重要组件
-            if name in ['decoder', 'head', 'clinical_encoder', 'clinical_fusion']:
+            if name in ['decoder', 'head_diagnosis', 'head_change', 'clinical_encoder', 'clinical_fusion']:
                 status = "✓ Active" if param_count > 0 else "✗ None/Empty"
                 logger.info(f"  {name:20}: {param_count:>10,} params {status}")
             else:
                 logger.info(f"  {name:20}: {param_count:>10,} params")
 
     total_params = sum(components.values())
-    logger.info(f"  {'=' * 40}")
+    logger.info(f"  {'='*40}")
     logger.info(f"  {'Total':20}: {total_params:>10,} params")
 
     # 检查特定组件状态
-    special_components = ['decoder', 'head']
+    special_components = ['decoder', 'head_diagnosis', 'head_change']
     logger.info(f"\nSpecial component status:")
     for comp in special_components:
         if hasattr(model_to_check, comp):
@@ -272,13 +272,12 @@ def log_model_components(model, phase="unknown", logger=None):
         else:
             logger.info(f"  - {comp}: Not found")
 
-    logger.info(f"{'=' * 50}")
+    logger.info(f"{'='*50}")
 
     return components
 
 
-def generate_mask(input_size: Tuple[int, int], patch_size: int, mask_ratio: float,
-                  device: torch.device) -> torch.Tensor:
+def generate_mask(input_size: Tuple[int, int], patch_size: int, mask_ratio: float, device: torch.device) -> torch.Tensor:
     """生成SimMIM的随机mask - patch级别的mask"""
     H, W = input_size
     # 计算patch的数量
@@ -303,12 +302,9 @@ def norm_targets(targets, patch_size):
 
     targets_square = targets ** 2.
 
-    targets_mean = F.avg_pool2d(targets, kernel_size=patch_size, stride=1, padding=patch_size // 2,
-                                count_include_pad=False)
-    targets_square_mean = F.avg_pool2d(targets_square, kernel_size=patch_size, stride=1, padding=patch_size // 2,
-                                       count_include_pad=False)
-    targets_count = F.avg_pool2d(targets_count, kernel_size=patch_size, stride=1, padding=patch_size // 2,
-                                 count_include_pad=True) * (patch_size ** 2)
+    targets_mean = F.avg_pool2d(targets, kernel_size=patch_size, stride=1, padding=patch_size // 2, count_include_pad=False)
+    targets_square_mean = F.avg_pool2d(targets_square, kernel_size=patch_size, stride=1, padding=patch_size // 2, count_include_pad=False)
+    targets_count = F.avg_pool2d(targets_count, kernel_size=patch_size, stride=1, padding=patch_size // 2, count_include_pad=True) * (patch_size ** 2)
 
     targets_var = (targets_square_mean - targets_mean ** 2.) * (targets_count / (targets_count - 1))
     targets_var = torch.clamp(targets_var, min=0.)
@@ -316,6 +312,38 @@ def norm_targets(targets, patch_size):
     targets_ = (targets_ - targets_mean) / (targets_var + 1.e-6) ** 0.5
 
     return targets_
+
+
+def create_data_loaders(config, phase='pretrain'):
+    """
+    创建数据加载器，支持不同阶段使用不同的batch size
+
+    Args:
+        config: 配置对象
+        phase: 'pretrain' or 'finetune'
+    """
+    # 临时修改batch size
+    original_batch_size = config.DATA.BATCH_SIZE
+
+    if phase == 'pretrain':
+        batch_size = getattr(config.DATA, 'BATCH_SIZE_PRETRAIN', config.DATA.BATCH_SIZE)
+    else:  # finetune
+        batch_size = getattr(config.DATA, 'BATCH_SIZE_FINETUNE', config.DATA.BATCH_SIZE)
+
+    # 临时修改配置
+    config.defrost()
+    config.DATA.BATCH_SIZE = batch_size
+    config.freeze()
+
+    # 创建数据加载器
+    dataset_train, dataset_val, train_loader, val_loader, mixup_fn = build_loader_finetune(config)
+
+    # 恢复原始配置
+    config.defrost()
+    config.DATA.BATCH_SIZE = original_batch_size
+    config.freeze()
+
+    return dataset_train, dataset_val, train_loader, val_loader, mixup_fn
 
 
 class EarlyStopping:
@@ -407,167 +435,131 @@ class SimMIMLoss(nn.Module):
         return loss
 
 
-class SingleTaskLoss(nn.Module):
-    """单任务损失函数"""
+class MultiTaskLoss(nn.Module):
+    """多任务损失函数 - MMoE版本 - 支持7分类change label"""
 
-    def __init__(self, num_classes=2, label_smoothing=0.0, class_weights=None):
+    def __init__(self, weight_diagnosis=1.0, weight_change=1.0, label_smoothing=0.0,
+                 num_diagnosis_classes=3, num_change_classes=7):
         super().__init__()
-        self.num_classes = num_classes
-        self.criterion = CrossEntropyLoss(
-            label_smoothing=label_smoothing,
-            weight=class_weights
-        )
+        self.criterion_diagnosis = CrossEntropyLoss(label_smoothing=label_smoothing)
+        self.criterion_change = CrossEntropyLoss(label_smoothing=label_smoothing)
+        self.weight_diagnosis = weight_diagnosis
+        self.weight_change = weight_change
+        self.num_diagnosis_classes = num_diagnosis_classes
+        self.num_change_classes = num_change_classes
 
-    def forward(self, outputs: torch.Tensor, labels: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, outputs: Tuple[torch.Tensor, torch.Tensor],
+                diagnosis_labels: torch.Tensor, change_labels: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        计算单任务损失
-        Args:
-            outputs: 模型输出 [B, num_classes]
-            labels: 标签 [B] (0-based indexing)
+        计算两个任务的损失
+        注意：标签是1-based，需要转换为0-based
         Returns:
-            包含total_loss的字典
+            包含total_loss, diagnosis_loss, change_loss的字典
         """
-        loss = self.criterion(outputs, labels)
+        output_diagnosis, output_change = outputs
+
+        # 将标签从1-based转换为0-based
+        diagnosis_labels_zero_indexed = diagnosis_labels - 1
+        change_labels_zero_indexed = change_labels - 1
+
+        # 确保标签在有效范围内
+        assert torch.all(diagnosis_labels_zero_indexed >= 0) and torch.all(diagnosis_labels_zero_indexed < self.num_diagnosis_classes), \
+            f"Invalid diagnosis labels: {diagnosis_labels_zero_indexed}"
+        assert torch.all(change_labels_zero_indexed >= 0) and torch.all(change_labels_zero_indexed < self.num_change_classes), \
+            f"Invalid change labels: {change_labels_zero_indexed}"
+
+        loss_diagnosis = self.criterion_diagnosis(output_diagnosis, diagnosis_labels_zero_indexed)
+        loss_change = self.criterion_change(output_change, change_labels_zero_indexed)
+
+        total_loss = self.weight_diagnosis * loss_diagnosis + self.weight_change * loss_change
 
         return {
-            'total': loss,
-            'classification': loss
+            'total': total_loss,
+            'diagnosis': loss_diagnosis,
+            'change': loss_change
         }
 
 
-def compute_metrics(outputs: torch.Tensor, labels: torch.Tensor, num_classes: int) -> Dict[str, float]:
-    """计算评估指标 - 单任务版本 - FIXED"""
-    # 获取预测结果
-    pred = torch.argmax(outputs, dim=1).cpu().numpy()
-    labels_np = labels.cpu().numpy()
+def compute_metrics(outputs: Tuple[torch.Tensor, torch.Tensor],
+                    diagnosis_labels: torch.Tensor, change_labels: torch.Tensor,
+                    num_diagnosis_classes=3, num_change_classes=7) -> Dict[str, float]:
+    """计算评估指标 - MMoE版本 - 支持7分类"""
+    output_diagnosis, output_change = outputs
+
+    # 获取预测结果（预测的是0-based，需要转回1-based）
+    pred_diagnosis = torch.argmax(output_diagnosis, dim=1).cpu().numpy() + 1
+    pred_change = torch.argmax(output_change, dim=1).cpu().numpy() + 1
+
+    diagnosis_labels_np = diagnosis_labels.cpu().numpy()
+    change_labels_np = change_labels.cpu().numpy()
 
     # 计算准确率
-    accuracy = accuracy_score(labels_np, pred)
+    acc_diagnosis = accuracy_score(diagnosis_labels_np, pred_diagnosis)
+    acc_change = accuracy_score(change_labels_np, pred_change)
 
     # 计算F1分数
-    if num_classes == 2:
-        # 二分类
-        # 添加调试信息（训练初期）
-        unique_preds = np.unique(pred)
-        unique_labels = np.unique(labels_np)
+    diagnosis_labels_list = list(range(1, num_diagnosis_classes + 1))
+    change_labels_list = list(range(1, num_change_classes + 1))
 
-        if np.random.random() < 0.01:  # 随机打印1%的批次
-            print(f"\n[DEBUG] Unique predictions: {unique_preds}, Unique labels: {unique_labels}")
-            print(f"[DEBUG] Pred distribution: {np.bincount(pred, minlength=2)}")
-            print(f"[DEBUG] Label distribution: {np.bincount(labels_np, minlength=2)}")
+    f1_diagnosis = f1_score(diagnosis_labels_np, pred_diagnosis, labels=diagnosis_labels_list,
+                           average='weighted', zero_division=0)
+    f1_change = f1_score(change_labels_np, pred_change, labels=change_labels_list,
+                        average='weighted', zero_division=0)
 
-        # 使用zero_division=0来避免警告
-        f1 = f1_score(labels_np, pred, average='binary', zero_division=0)
+    return {
+        'acc_diagnosis': acc_diagnosis,
+        'acc_change': acc_change,
+        'f1_diagnosis': f1_diagnosis,
+        'f1_change': f1_change,
+        'acc_avg': (acc_diagnosis + acc_change) / 2,
+        'f1_avg': (f1_diagnosis + f1_change) / 2
+    }
 
-        # 计算AUC (仅二分类)
-        try:
-            if len(unique_labels) > 1:  # 只有当有两个类别时才计算AUC
-                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
-                auc = roc_auc_score(labels_np, probs)
-            else:
-                auc = 0.0
-        except:
-            auc = 0.0
 
-        # 计算敏感性和特异性
-        try:
-            cm = confusion_matrix(labels_np, pred, labels=[0, 1])
-            if cm.shape == (2, 2):
-                tn, fp, fn, tp = cm.ravel()
-            else:
-                # 如果只有一个类别，创建一个伪矩阵
-                tn = fp = fn = tp = 0
-                if 0 in labels_np:
-                    tn = len(labels_np)
-                else:
-                    tp = len(labels_np)
-        except:
-            tn = fp = fn = tp = 0
-
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-
-        return {
-            'accuracy': accuracy,
-            'f1': f1,
-            'auc': auc,
-            'sensitivity': sensitivity,
-            'specificity': specificity,
-            'balanced_accuracy': (sensitivity + specificity) / 2
-        }
-    else:
-        # 多分类
-        f1_macro = f1_score(labels_np, pred, average='macro', zero_division=0)
-        f1_weighted = f1_score(labels_np, pred, average='weighted', zero_division=0)
-
-        # 计算每类准确率
-        cm = confusion_matrix(labels_np, pred, labels=list(range(num_classes)))
-        per_class_acc = np.zeros(num_classes)
-
-        for i in range(num_classes):
-            if cm[i].sum() > 0:
-                per_class_acc[i] = cm[i, i] / cm[i].sum()
-            else:
-                per_class_acc[i] = 0.0
-
-        return {
-            'accuracy': accuracy,
-            'f1_macro': f1_macro,
-            'f1_weighted': f1_weighted,
-            'balanced_accuracy': np.mean(per_class_acc),
-            'per_class_accuracy': per_class_acc.tolist()
-        }
-
-def log_expert_utilization(model, val_loader, device, epoch, num_classes):
-    """记录专家利用率 - 用于分析单任务MoE的工作情况"""
+def log_expert_utilization(model, val_loader, device, epoch, num_experts=8):
+    """记录专家利用率 - 用于分析MMoE的工作情况（支持clinical prior和8专家）"""
     model.eval()
+    expert_weights_list = []
 
     with torch.no_grad():
         # 只取一个batch进行分析
         batch = next(iter(val_loader))
         images = batch['image'].to(device)
-        labels = batch['label'].to(device)
-        clinical_priors = batch.get('prior', None)
-        if clinical_priors is not None:
-            clinical_priors = clinical_priors.to(device)
+        diagnosis_labels = batch['label'].to(device)
+        change_labels = batch['change_label'].to(device)
+        clinical_priors = batch['prior'].to(device)
 
         # 获取专家利用率
         try:
             expert_utilization = model.get_expert_utilization(
                 images,
                 clinical_prior=clinical_priors,
-                labels=labels
+                lbls_diagnosis=diagnosis_labels,
+                lbls_change=change_labels
             )
 
             if expert_utilization:
-                # 分析每层的专家权重
+                # 计算平均专家权重
                 for layer_idx, gate_weights in enumerate(expert_utilization):
-                    if 'task_weights' in gate_weights:
-                        task_weights = gate_weights['task_weights'].mean(dim=[0, 1])  # [num_experts]
-                        expert_names = gate_weights.get('expert_names',
-                                                        [f'Expert_{i}' for i in range(len(task_weights))])
+                    if 'diagnosis_weights' in gate_weights:
+                        diagnosis_weights = gate_weights['diagnosis_weights'].mean(dim=[0, 1])  # [num_experts]
+                        change_weights = gate_weights['change_weights'].mean(dim=[0, 1])  # [num_experts]
 
-                        # 记录到wandb
+                        # 记录到wandb - 8个专家
+                        expert_names = ['Shared1', 'Shared2', 'CN1', 'CN2', 'MCI1', 'MCI2', 'AD1', 'AD2']
                         for i, name in enumerate(expert_names):
                             wandb.log({
-                                f'expert_utilization/layer_{layer_idx}_{name}': task_weights[i].item(),
+                                f'expert_utilization/layer_{layer_idx}_diagnosis_{name}': diagnosis_weights[i].item(),
+                                f'expert_utilization/layer_{layer_idx}_change_{name}': change_weights[i].item(),
                                 'epoch': epoch
                             })
-
-                        # 记录专家多样性（熵）
-                        entropy = -torch.sum(task_weights * torch.log(task_weights + 1e-8))
-                        wandb.log({
-                            f'expert_utilization/layer_{layer_idx}_entropy': entropy.item(),
-                            'epoch': epoch
-                        })
-
         except Exception as e:
             logging.warning(f"Failed to log expert utilization: {e}")
 
 
 def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, scheduler, device, epoch,
-                             mask_ratio=0.6, patch_size=4, img_size=256, position=0):
-    """预训练一个epoch - SimMIM重建任务 - FIXED版本"""
+                            mask_ratio=0.6, patch_size=4, img_size=256, position=0):
+    """预训练一个epoch - SimMIM重建任务"""
     model.train()
 
     # 确保模型处于预训练模式
@@ -590,29 +582,11 @@ def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, s
     for idx, batch in pbar:
         # 获取数据
         images = batch['image'].to(device)
-        labels = batch['label'].to(device)
-        clinical_priors = batch.get('prior', None)
-        if clinical_priors is not None:
-            clinical_priors = clinical_priors.to(device)
+        diagnosis_labels = batch['label'].to(device)
+        change_labels = batch['change_label'].to(device)
+        clinical_priors = batch['prior'].to(device)
 
         batch_size = images.shape[0]
-
-        # ===== CRITICAL FIX: 确保标签转换为0-based =====
-        # 数据集使用1-based标签 (1,2,3)，模型需要0-based标签 (0,1,2)
-        labels_zero_based = labels - 1
-
-        # 安全检查：确保转换后的标签在有效范围内
-        min_label = labels_zero_based.min().item()
-        max_label = labels_zero_based.max().item()
-
-        if min_label < 0:
-            print(f"Warning: Found label < 1 in dataset, min original label: {labels.min().item()}")
-            labels_zero_based = torch.clamp(labels_zero_based, min=0)
-
-        # 可以添加日志来验证转换
-        if idx == 0:  # 只在第一个batch打印
-            print(
-                f"Label conversion check - Original: {labels[:3].tolist()}, Converted: {labels_zero_based[:3].tolist()}")
 
         # 生成mask
         masks = torch.stack([
@@ -620,11 +594,12 @@ def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, s
             for _ in range(batch_size)
         ])
 
-        # 前向传播 - SimMIM重建，使用转换后的0-based标签
+        # 前向传播 - SimMIM重建
         reconstructed = model(
             images,
             clinical_prior=clinical_priors,
-            labels=labels_zero_based,  # 使用0-based标签
+            lbls_diagnosis=diagnosis_labels - 1,  # 转换为0-based
+            lbls_change=change_labels - 1,
             mask=masks
         )
 
@@ -654,8 +629,8 @@ def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, s
 
 
 def train_one_epoch_finetune(model, train_loader, criterion, optimizer, scheduler, device, epoch,
-                             num_classes, use_timm_scheduler=False, position=0):
-    """微调一个epoch - 单任务分类 - FIXED版本"""
+                            use_timm_scheduler=False, position=0, num_diagnosis_classes=3, num_change_classes=7):
+    """微调一个epoch - 分类任务 - 支持7分类"""
     model.train()
 
     # 确保模型处于微调模式
@@ -665,6 +640,8 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
         layer.set_pretrain_mode(False)
 
     total_loss = 0
+    total_diagnosis_loss = 0
+    total_change_loss = 0
     all_metrics = []
 
     pbar = tqdm(
@@ -678,32 +655,20 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
     for idx, batch in pbar:
         # 获取数据
         images = batch['image'].to(device)
-        labels = batch['label'].to(device)
-        clinical_priors = batch.get('prior', None)
-        if clinical_priors is not None:
-            clinical_priors = clinical_priors.to(device)
+        diagnosis_labels = batch['label'].to(device)
+        change_labels = batch['change_label'].to(device)
+        clinical_priors = batch['prior'].to(device)
 
-        # ===== CRITICAL FIX: 确保标签转换为0-based =====
-        # 数据集使用1-based标签 (1,2,3)，模型需要0-based标签 (0,1,2)
-        labels_zero_based = labels - 1
-
-        # 安全检查
-        labels_zero_based = torch.clamp(labels_zero_based, min=0, max=num_classes - 1)
-
-        # 验证日志
-        if idx == 0:
-            print(
-                f"Finetune label check - Original: {labels[:3].tolist()}, Converted: {labels_zero_based[:3].tolist()}")
-
-        # 前向传播 - 分类任务，使用转换后的0-based标签
+        # 前向传播 - 分类任务
         outputs = model(
             images,
             clinical_prior=clinical_priors,
-            labels=labels_zero_based  # 使用0-based标签
+            lbls_diagnosis=diagnosis_labels - 1,  # Convert to 0-indexed
+            lbls_change=change_labels - 1
         )
 
-        # 计算损失 - 注意：criterion期望0-based标签
-        losses = criterion(outputs, labels_zero_based)  # 使用转换后的标签
+        # 计算损失
+        losses = criterion(outputs, diagnosis_labels, change_labels)
         loss = losses['total']
 
         # 反向传播
@@ -716,53 +681,45 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
 
         # 记录损失
         total_loss += loss.item()
+        total_diagnosis_loss += losses['diagnosis'].item()
+        total_change_loss += losses['change'].item()
 
-        # 计算指标 - 为了计算指标，我们需要把标签转换回原始格式
+        # 计算指标
         with torch.no_grad():
-            # 注意：compute_metrics函数可能期望原始标签格式，所以我们传入原始标签
-            metrics = compute_metrics(outputs, labels_zero_based, num_classes)
+            metrics = compute_metrics(outputs, diagnosis_labels, change_labels,
+                                    num_diagnosis_classes, num_change_classes)
             all_metrics.append(metrics)
 
         # 更新进度条
         current_lr = optimizer.param_groups[0]['lr']
-        if num_classes == 2:
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'acc': f"{metrics['accuracy']:.4f}",
-                'f1': f"{metrics['f1']:.4f}",
-                'auc': f"{metrics['auc']:.4f}",
-                'lr': f"{current_lr:.2e}"
-            })
-        else:
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'acc': f"{metrics['accuracy']:.4f}",
-                'f1': f"{metrics['f1_weighted']:.4f}",
-                'lr': f"{current_lr:.2e}"
-            })
+        pbar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'acc_diag': f"{metrics['acc_diagnosis']:.4f}",
+            'acc_chg': f"{metrics['acc_change']:.4f}",
+            'acc_avg': f"{metrics['acc_avg']:.4f}",
+            'lr': f"{current_lr:.2e}"
+        })
 
     if use_timm_scheduler:
         scheduler.step(epoch)
 
     # 计算平均值
     avg_loss = total_loss / len(train_loader)
+    avg_diagnosis_loss = total_diagnosis_loss / len(train_loader)
+    avg_change_loss = total_change_loss / len(train_loader)
 
     # 计算平均指标
     avg_metrics = {}
     for key in all_metrics[0].keys():
-        if key == 'per_class_accuracy':
-            # 特殊处理per_class_accuracy
-            avg_metrics[key] = np.mean([m[key] for m in all_metrics], axis=0).tolist()
-        else:
-            avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+        avg_metrics[key] = np.mean([m[key] for m in all_metrics])
 
-    return avg_loss, avg_metrics
+    return avg_loss, avg_diagnosis_loss, avg_change_loss, avg_metrics
 
 
 @torch.no_grad()
 def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
-                      mask_ratio=0.6, patch_size=4, img_size=256, position=2):
-    """预训练验证 - SimMIM重建任务 - FIXED版本"""
+                     mask_ratio=0.6, patch_size=4, img_size=256, position=2):
+    """预训练验证 - SimMIM重建任务"""
     model.eval()
 
     # 确保模型处于预训练模式
@@ -784,16 +741,11 @@ def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
     for idx, batch in pbar:
         # 获取数据
         images = batch['image'].to(device)
-        labels = batch['label'].to(device)
-        clinical_priors = batch.get('prior', None)
-        if clinical_priors is not None:
-            clinical_priors = clinical_priors.to(device)
+        diagnosis_labels = batch['label'].to(device)
+        change_labels = batch['change_label'].to(device)
+        clinical_priors = batch['prior'].to(device)
 
         batch_size = images.shape[0]
-
-        # ===== CRITICAL FIX: 确保标签转换为0-based =====
-        labels_zero_based = labels - 1
-        labels_zero_based = torch.clamp(labels_zero_based, min=0)
 
         # 生成mask
         masks = torch.stack([
@@ -801,11 +753,12 @@ def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
             for _ in range(batch_size)
         ])
 
-        # 前向传播，使用转换后的0-based标签
+        # 前向传播
         reconstructed = model(
             images,
             clinical_prior=clinical_priors,
-            labels=labels_zero_based,  # 使用0-based标签
+            lbls_diagnosis=diagnosis_labels - 1,
+            lbls_change=change_labels - 1,
             mask=masks
         )
 
@@ -824,8 +777,9 @@ def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
 
 
 @torch.no_grad()
-def validate_finetune(model, val_loader, criterion, device, epoch, num_classes, position=2):
-    """微调验证 - 单任务分类 - FIXED版本"""
+def validate_finetune(model, val_loader, criterion, device, epoch, position=2,
+                     num_diagnosis_classes=3, num_change_classes=7):
+    """微调验证 - 分类任务 - 支持7分类"""
     model.eval()
 
     # 确保模型处于微调模式
@@ -835,11 +789,15 @@ def validate_finetune(model, val_loader, criterion, device, epoch, num_classes, 
         layer.set_pretrain_mode(False)
 
     total_loss = 0
+    total_diagnosis_loss = 0
+    total_change_loss = 0
     all_metrics = []
 
     # For confusion matrix and classification report
-    all_pred = []
-    all_true = []
+    all_pred_diagnosis = []
+    all_true_diagnosis = []
+    all_pred_change = []
+    all_true_change = []
 
     pbar = tqdm(
         enumerate(val_loader),
@@ -852,88 +810,99 @@ def validate_finetune(model, val_loader, criterion, device, epoch, num_classes, 
     for idx, batch in pbar:
         # 获取数据
         images = batch['image'].to(device)
-        labels = batch['label'].to(device)
-        clinical_priors = batch.get('prior', None)
-        if clinical_priors is not None:
-            clinical_priors = clinical_priors.to(device)
+        diagnosis_labels = batch['label'].to(device)
+        change_labels = batch['change_label'].to(device)
+        clinical_priors = batch['prior'].to(device)
 
-        # ===== CRITICAL FIX: 确保标签转换为0-based =====
-        labels_zero_based = labels - 1
-        labels_zero_based = torch.clamp(labels_zero_based, min=0, max=num_classes - 1)
-
-        # 前向传播，使用转换后的0-based标签
+        # 前向传播
         outputs = model(
             images,
             clinical_prior=clinical_priors,
-            labels=labels_zero_based  # 使用0-based标签
+            lbls_diagnosis=diagnosis_labels,
+            lbls_change=change_labels
         )
 
         # 计算损失
-        losses = criterion(outputs, labels_zero_based)
+        losses = criterion(outputs, diagnosis_labels, change_labels)
 
         # 记录损失
         total_loss += losses['total'].item()
+        total_diagnosis_loss += losses['diagnosis'].item()
+        total_change_loss += losses['change'].item()
 
         # 计算指标
-        metrics = compute_metrics(outputs, labels_zero_based, num_classes)
+        metrics = compute_metrics(outputs, diagnosis_labels, change_labels,
+                                num_diagnosis_classes, num_change_classes)
         all_metrics.append(metrics)
 
-        # 收集预测结果 - 注意：这里我们需要转换回原始标签格式进行分析
-        pred = torch.argmax(outputs, dim=1).cpu().numpy()
-        pred_original = pred + 1  # 转换预测结果回1-based
-        labels_original = labels.cpu().numpy()  # 使用原始1-based标签
+        # 收集预测结果
+        output_diagnosis, output_change = outputs
+        pred_diagnosis = torch.argmax(output_diagnosis, dim=1).cpu().numpy() + 1
+        pred_change = torch.argmax(output_change, dim=1).cpu().numpy() + 1
 
-        all_pred.extend(pred_original)
-        all_true.extend(labels_original)
+        all_pred_diagnosis.extend(pred_diagnosis)
+        all_true_diagnosis.extend(diagnosis_labels.cpu().numpy())
+        all_pred_change.extend(pred_change)
+        all_true_change.extend(change_labels.cpu().numpy())
 
         # 更新进度条
-        if num_classes == 2:
-            pbar.set_postfix({
-                'loss': f"{losses['total'].item():.4f}",
-                'acc': f"{metrics['accuracy']:.4f}",
-                'f1': f"{metrics['f1']:.4f}",
-                'auc': f"{metrics['auc']:.4f}"
-            })
-        else:
-            pbar.set_postfix({
-                'loss': f"{losses['total'].item():.4f}",
-                'acc': f"{metrics['accuracy']:.4f}",
-                'f1': f"{metrics['f1_weighted']:.4f}"
-            })
+        pbar.set_postfix({
+            'loss': f"{losses['total'].item():.4f}",
+            'acc': f"{metrics['acc_avg']:.4f}"
+        })
 
     # 计算平均值
     avg_loss = total_loss / len(val_loader)
+    avg_diagnosis_loss = total_diagnosis_loss / len(val_loader)
+    avg_change_loss = total_change_loss / len(val_loader)
 
     # 计算平均指标
     avg_metrics = {}
     for key in all_metrics[0].keys():
-        if key == 'per_class_accuracy':
-            avg_metrics[key] = np.mean([m[key] for m in all_metrics], axis=0).tolist()
-        else:
-            avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+        avg_metrics[key] = np.mean([m[key] for m in all_metrics])
 
-    # 计算混淆矩阵 - 使用原始1-based标签
-    cm = confusion_matrix(all_true, all_pred, labels=list(range(1, num_classes + 1)))
+    # 计算混淆矩阵
+    cm_diagnosis = confusion_matrix(all_true_diagnosis, all_pred_diagnosis,
+                                   labels=list(range(1, num_diagnosis_classes + 1)))
+    cm_change = confusion_matrix(all_true_change, all_pred_change,
+                                labels=list(range(1, num_change_classes + 1)))
 
-    return avg_loss, avg_metrics, cm, all_true, all_pred
+    return (avg_loss, avg_diagnosis_loss, avg_change_loss, avg_metrics, cm_diagnosis, cm_change,
+            all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change)
 
 
-def trainer_alzheimer_single_task(args, model, snapshot_path):
-    """Alzheimer's disease single-task trainer with MoE - 支持SimMIM预训练 + 智能权重管理"""
-    model_name = getattr(args, 'model_name', 'swin_single_task')
+def create_detailed_confusion_matrix_plot(cm, labels, title, figsize=(10, 8)):
+    """创建详细的混淆矩阵图 - 支持7x7矩阵"""
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # 使用热力图
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=labels, yticklabels=labels,
+                square=True, cbar_kws={'label': 'Count'})
+
+    plt.title(title, fontsize=16)
+    plt.xlabel('Predicted', fontsize=12)
+    plt.ylabel('True', fontsize=12)
+
+    # 旋转标签以防重叠
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+
+    plt.tight_layout()
+    return fig
+
+
+def trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path):
+    """Alzheimer's disease dual-task trainer with MMoE main function - 支持SimMIM预训练 + 7分类change label"""
+    model_name = getattr(args, 'model_name', 'swin_admoe_nine_label')
     if hasattr(args, 'MODEL') and hasattr(args.MODEL, 'NAME'):
         model_name = args.MODEL.NAME
-
-    # 获取任务信息
-    num_classes = getattr(args, 'num_classes', 2)
-    task_type = getattr(args, 'task_type', 'binary')
-    class_names = getattr(args, 'class_names', [f'Class_{i}' for i in range(num_classes)])
 
     # 添加时间戳和模型名称到快照路径
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     snapshot_path = os.path.join(
         os.path.dirname(snapshot_path),
-        f"{model_name}_{task_type}_{num_classes}class_{timestamp}"
+        f"{model_name}_{timestamp}"
     )
     os.makedirs(snapshot_path, exist_ok=True)
 
@@ -946,26 +915,25 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
+    # 获取类别数量
+    num_diagnosis_classes = getattr(args, 'num_classes_diagnosis', 3)
+    num_change_classes = getattr(args, 'num_classes_change', 7)
+
+    logging.info(f"Number of diagnosis classes: {num_diagnosis_classes}")
+    logging.info(f"Number of change classes: {num_change_classes}")
+
     # Initialize wandb
-    wandb_name = getattr(args, 'wandb_run_name', f'single_task_{task_type}_{num_classes}class')
+    wandb_name = getattr(args, 'wandb_run_name', getattr(args, 'exp_name', 'alzheimer_mmoe_nine_label_run'))
     wandb_dir = os.path.join(os.path.dirname(snapshot_path), 'wandb')
     os.makedirs(wandb_dir, exist_ok=True)
 
     wandb.init(
-        project=getattr(args, 'wandb_project', f'alzheimer-single-task-{task_type}'),
+        project=getattr(args, 'wandb_project', 'alzheimer-mmoe-nine-label'),
         name=wandb_name,
         config=vars(args) if hasattr(args, '__dict__') else args,
         dir=wandb_dir,
         mode='offline' if getattr(args, 'wandb_offline', False) else 'online'
     )
-
-    # Log task information
-    wandb.config.update({
-        'task_type': task_type,
-        'num_classes': num_classes,
-        'class_names': class_names,
-        'model_type': 'single_task'
-    })
 
     # Set random seed
     random.seed(args.seed)
@@ -1019,9 +987,26 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
         config = type('Config', (), {})()
         config.DATA = args.DATA if hasattr(args, 'DATA') else args
 
-    # Build data loaders
-    dataset_train, dataset_val, train_loader, val_loader, mixup_fn = build_loader_finetune(config)
+    # Training parameters
+    best_val_acc = 0
+    pretrain_epochs = getattr(args, 'pretrain_epochs', args.max_epochs // 2)
+
+    # SimMIM parameters
+    mask_ratio = getattr(args, 'mask_ratio', 0.6)
+    patch_size = getattr(args, 'patch_size', 4)
+    img_size = getattr(args, 'img_size', 256)
+
+    # 获取阶段特定的batch size
+    batch_size_pretrain = getattr(config.DATA, 'BATCH_SIZE_PRETRAIN', config.DATA.BATCH_SIZE)
+    batch_size_finetune = getattr(config.DATA, 'BATCH_SIZE_FINETUNE', config.DATA.BATCH_SIZE)
+
+    logging.info(f"Batch sizes - Pretrain: {batch_size_pretrain}, Finetune: {batch_size_finetune}")
+
+    # 初始创建数据加载器（预训练阶段）
+    current_phase = 'pretrain' if pretrain_epochs > 0 else 'finetune'
+    dataset_train, dataset_val, train_loader, val_loader, mixup_fn = create_data_loaders(config, current_phase)
     logging.info(f"Train set size: {len(dataset_train)}, Val set size: {len(dataset_val)}")
+    logging.info(f"Initial data loaders created for {current_phase} phase")
 
     # Multi-GPU support
     if torch.cuda.device_count() > 1:
@@ -1036,10 +1021,13 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
         norm_target_patch_size=getattr(args, 'norm_target_patch_size', 47)
     )
 
-    # 分类损失（微调）
-    criterion_classification = SingleTaskLoss(
-        num_classes=num_classes,
-        label_smoothing=getattr(args, 'label_smoothing', 0.0)
+    # 分类损失（微调）- 支持7分类
+    criterion_classification = MultiTaskLoss(
+        weight_diagnosis=getattr(args, 'weight_diagnosis', 1.0),
+        weight_change=getattr(args, 'weight_change', 1.0),
+        label_smoothing=getattr(args, 'label_smoothing', 0.0),
+        num_diagnosis_classes=num_diagnosis_classes,
+        num_change_classes=num_change_classes
     )
 
     # Optimizer
@@ -1094,12 +1082,29 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
     patch_size = getattr(args, 'patch_size', 4)
     img_size = getattr(args, 'img_size', 256)
 
-    logging.info(f"Training plan for {task_type} task ({num_classes} classes):")
-    logging.info(f"- Class names: {class_names}")
+    # Change label names for 7 classes
+    change_label_names = [
+        'Stable CN→CN',
+        'Stable MCI→MCI',
+        'Stable AD→AD',
+        'Conv CN→MCI',
+        'Conv MCI→AD',
+        'Conv CN→AD',
+        'Rev MCI→CN'
+    ]
+
+    diagnosis_names = ['CN', 'MCI', 'AD']
+
+    logging.info(f"Training plan:")
+    logging.info(f"- Total epochs: {args.max_epochs}")
     logging.info(f"- Pretraining epochs: {pretrain_epochs} (SimMIM reconstruction)")
     logging.info(f"- Finetuning epochs: {args.max_epochs - pretrain_epochs} (Classification)")
     logging.info(f"- SimMIM mask ratio: {mask_ratio}")
+    logging.info(f"- Batch sizes:")
+    logging.info(f"  - Pretrain: {batch_size_pretrain}")
+    logging.info(f"  - Finetune: {batch_size_finetune}")
     logging.info(f"- Starting from epoch: {start_epoch}")
+    logging.info(f"- Change labels: {change_label_names}")
 
     overall_pbar = tqdm(
         total=args.max_epochs - start_epoch,
@@ -1120,15 +1125,15 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
         logging.info(f"Learning rate: {current_lr:.6f}")
 
         is_pretrain = epoch < pretrain_epochs
-        phase = "Pretrain (SimMIM)" if is_pretrain else f"Finetune ({task_type.capitalize()})"
+        phase = "Pretrain (SimMIM)" if is_pretrain else "Finetune (Classification)"
         logging.info(f"Phase: {phase}")
 
         # ============== 阶段切换逻辑 ==============
         if not is_pretrain and not decoder_removed:
             # 从预训练切换到微调：移除decoder
-            logging.info("\n" + "=" * 80)
+            logging.info("\n" + "="*80)
             logging.info("SWITCHING FROM PRETRAINING TO FINETUNING")
-            logging.info("=" * 80)
+            logging.info("="*80)
 
             # 移除decoder
             remove_info = remove_decoder_from_model(model, logging.getLogger())
@@ -1142,6 +1147,12 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
                 'model_modification/params_after_removal': remove_info['params_after'],
                 'epoch': epoch
             })
+
+            # 重新创建数据加载器（使用微调阶段的batch size）
+            logging.info("Recreating data loaders for finetuning phase...")
+            dataset_train, dataset_val, train_loader, val_loader, mixup_fn = create_data_loaders(config, 'finetune')
+            num_steps_per_epoch = len(train_loader)  # 更新步数
+            logging.info(f"✓ Data loaders recreated with batch size: {batch_size_finetune}")
 
             # 重新创建optimizer（因为参数可能发生变化）
             logging.info("Recreating optimizer for remaining parameters...")
@@ -1208,102 +1219,92 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
                     break
 
         else:
-            # ===== 微调阶段：单任务分类 =====
-            train_loss, train_metrics = train_one_epoch_finetune(
+            # ===== 微调阶段：分类任务 =====
+            train_loss, train_diagnosis_loss, train_change_loss, train_metrics = train_one_epoch_finetune(
                 model, train_loader, criterion_classification, optimizer, scheduler, device, epoch,
-                num_classes, use_timm_scheduler=False, position=1
+                use_timm_scheduler=False, position=1,
+                num_diagnosis_classes=num_diagnosis_classes,
+                num_change_classes=num_change_classes
             )
 
             # Log training metrics
-            wandb_metrics = {
+            wandb.log({
                 'train/loss': train_loss,
-                'train/accuracy': train_metrics['accuracy'],
+                'train/loss_diagnosis': train_diagnosis_loss,
+                'train/loss_change': train_change_loss,
+                'train/acc_diagnosis': train_metrics['acc_diagnosis'],
+                'train/acc_change': train_metrics['acc_change'],
+                'train/acc_avg': train_metrics['acc_avg'],
+                'train/f1_diagnosis': train_metrics['f1_diagnosis'],
+                'train/f1_change': train_metrics['f1_change'],
+                'train/f1_avg': train_metrics['f1_avg'],
                 'train/lr': current_lr,
                 'train/phase': 0,  # 0 for finetune
                 'epoch': epoch
-            }
+            })
 
-            if num_classes == 2:
-                wandb_metrics.update({
-                    'train/f1': train_metrics['f1'],
-                    'train/auc': train_metrics['auc'],
-                    'train/sensitivity': train_metrics['sensitivity'],
-                    'train/specificity': train_metrics['specificity'],
-                    'train/balanced_accuracy': train_metrics['balanced_accuracy']
-                })
-            else:
-                wandb_metrics.update({
-                    'train/f1_macro': train_metrics['f1_macro'],
-                    'train/f1_weighted': train_metrics['f1_weighted'],
-                    'train/balanced_accuracy': train_metrics['balanced_accuracy']
-                })
-
-            wandb.log(wandb_metrics)
-
-            logging.info(f"Finetune - Loss: {train_loss:.4f}, Acc: {train_metrics['accuracy']:.4f}")
+            logging.info(f"Finetune - Loss: {train_loss:.4f}, Acc: {train_metrics['acc_avg']:.4f}")
 
             # Validation (every eval_interval epochs)
             if (epoch + 1) % args.eval_interval == 0:
-                val_results = validate_finetune(model, val_loader, criterion_classification, device, epoch, num_classes)
-                val_loss, val_metrics, cm, all_true, all_pred = val_results
+                val_results = validate_finetune(model, val_loader, criterion_classification, device, epoch,
+                                              num_diagnosis_classes=num_diagnosis_classes,
+                                              num_change_classes=num_change_classes)
+
+                if len(val_results) == 6:
+                    val_loss, val_diagnosis_loss, val_change_loss, val_metrics, cm_diagnosis, cm_change = val_results
+                    all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change = None, None, None, None
+                else:
+                    val_loss, val_diagnosis_loss, val_change_loss, val_metrics, cm_diagnosis, cm_change, \
+                        all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change = val_results
 
                 # Log validation metrics
-                wandb_val_metrics = {
-                    'val/loss': val_loss,
-                    'val/accuracy': val_metrics['accuracy'],
-                    'val/phase': 0,  # 0 for finetune
-                    'epoch': epoch
-                }
-
-                if num_classes == 2:
-                    wandb_val_metrics.update({
-                        'val/f1': val_metrics['f1'],
-                        'val/auc': val_metrics['auc'],
-                        'val/sensitivity': val_metrics['sensitivity'],
-                        'val/specificity': val_metrics['specificity'],
-                        'val/balanced_accuracy': val_metrics['balanced_accuracy']
-                    })
-                else:
-                    wandb_val_metrics.update({
-                        'val/f1_macro': val_metrics['f1_macro'],
-                        'val/f1_weighted': val_metrics['f1_weighted'],
-                        'val/balanced_accuracy': val_metrics['balanced_accuracy']
-                    })
-
-                wandb.log(wandb_val_metrics)
-
-                # Log expert utilization (only during finetuning)
-                log_expert_utilization(model, val_loader, device, epoch, num_classes)
-
-                # Log confusion matrix
-                fig_cm = plt.figure(figsize=(8, 6))
-                plt.imshow(cm, interpolation='nearest', cmap='Blues')
-                plt.title(f'Confusion Matrix - {task_type.capitalize()} Classification')
-                plt.colorbar()
-                tick_marks = np.arange(num_classes)
-                plt.xticks(tick_marks, class_names, rotation=45)
-                plt.yticks(tick_marks, class_names)
-                plt.xlabel('Predicted')
-                plt.ylabel('True')
-
-                for i in range(num_classes):
-                    for j in range(num_classes):
-                        plt.text(j, i, str(cm[i, j]),
-                                 ha="center", va="center", color="black")
-                plt.tight_layout()
-
                 wandb.log({
-                    'val/confusion_matrix': wandb.Image(fig_cm),
+                    'val/loss': val_loss,
+                    'val/loss_diagnosis': val_diagnosis_loss,
+                    'val/loss_change': val_change_loss,
+                    'val/acc_diagnosis': val_metrics['acc_diagnosis'],
+                    'val/acc_change': val_metrics['acc_change'],
+                    'val/acc_avg': val_metrics['acc_avg'],
+                    'val/f1_diagnosis': val_metrics['f1_diagnosis'],
+                    'val/f1_change': val_metrics['f1_change'],
+                    'val/f1_avg': val_metrics['f1_avg'],
+                    'val/phase': 0,  # 0 for finetune
                     'epoch': epoch
                 })
 
-                plt.close(fig_cm)
+                # Log expert utilization (only during finetuning)
+                log_expert_utilization(model, val_loader, device, epoch, num_experts=8)
 
-                logging.info(f"Finetune Val - Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']:.4f}")
+                # Log confusion matrices
+                # Diagnosis confusion matrix (3x3)
+                fig_cm_diagnosis = create_detailed_confusion_matrix_plot(
+                    cm_diagnosis, diagnosis_names,
+                    'Confusion Matrix - Diagnosis (3 classes)',
+                    figsize=(8, 6)
+                )
+
+                # Change confusion matrix (7x7)
+                fig_cm_change = create_detailed_confusion_matrix_plot(
+                    cm_change, change_label_names,
+                    'Confusion Matrix - Change Label (7 classes)',
+                    figsize=(12, 10)
+                )
+
+                wandb.log({
+                    'val/confusion_matrix_diagnosis': wandb.Image(fig_cm_diagnosis),
+                    'val/confusion_matrix_change': wandb.Image(fig_cm_change),
+                    'epoch': epoch
+                })
+
+                plt.close(fig_cm_diagnosis)
+                plt.close(fig_cm_change)
+
+                logging.info(f"Finetune Val - Loss: {val_loss:.4f}, Acc: {val_metrics['acc_avg']:.4f}")
 
                 # Save best model (only during finetuning)
-                if val_metrics['accuracy'] > best_val_acc:
-                    best_val_acc = val_metrics['accuracy']
+                if val_metrics['acc_avg'] > best_val_acc:
+                    best_val_acc = val_metrics['acc_avg']
                     best_model_path = os.path.join(snapshot_path, 'best_model.pth')
 
                     model_to_save = model.module if hasattr(model, 'module') else model
@@ -1322,7 +1323,7 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
                     wandb.run.summary['best_epoch'] = epoch
 
                 # Early stopping based on classification accuracy
-                early_stopping(-val_metrics['accuracy'], model, os.path.join(snapshot_path, 'finetune_checkpoint.pth'))
+                early_stopping(-val_metrics['acc_avg'], model, os.path.join(snapshot_path, 'finetune_checkpoint.pth'))
                 if early_stopping.early_stop:
                     logging.info("Early stopping triggered during finetuning!")
                     break
@@ -1347,10 +1348,7 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
                 'best_val_acc': best_val_acc,
                 'is_pretrain': is_pretrain,
                 'phase': phase,
-                'decoder_removed': decoder_removed,
-                'task_type': task_type,
-                'num_classes': num_classes,
-                'class_names': class_names
+                'decoder_removed': decoder_removed
             }, checkpoint_path)
 
             logging.info(f"Checkpoint saved at epoch {epoch}")
@@ -1374,20 +1372,8 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
     log_model_components(model, "Final", logging.getLogger())
 
     logging.info(f"\nTraining completed!")
-    logging.info(f"Task: {task_type} ({num_classes} classes)")
-    logging.info(f"Classes: {class_names}")
     if best_val_acc > 0:
         logging.info(f"Best validation accuracy: {best_val_acc:.4f}")
-
-    # 记录最终结果到wandb
-    wandb.run.summary.update({
-        'final_accuracy': best_val_acc,
-        'task_type': task_type,
-        'num_classes': num_classes,
-        'class_names': class_names,
-        'total_epochs': args.max_epochs,
-        'pretrain_epochs': pretrain_epochs
-    })
 
     wandb.finish()
     overall_pbar.close()
@@ -1395,26 +1381,15 @@ def trainer_alzheimer_single_task(args, model, snapshot_path):
     return "Training Finished!"
 
 
-# 使用示例的参数类 - 单任务版本
+# 使用示例的参数类 - 添加SimMIM参数
 class Args:
-    def __init__(self, task_type='binary', num_classes=2):
+    def __init__(self):
         # 基础参数
         self.seed = 42
         self.max_epochs = 100
         self.eval_interval = 10
         self.save_interval = 20
-        self.patience = 10
-
-        # 任务特定参数
-        self.task_type = task_type
-        self.num_classes = num_classes
-
-        if task_type == 'binary' or num_classes == 2:
-            self.class_names = ['CN', 'AD']
-        elif task_type == 'diagnosis' or num_classes == 3:
-            self.class_names = ['CN', 'MCI', 'AD']
-        else:
-            self.class_names = [f'Class_{i}' for i in range(num_classes)]
+        self.patience = 10  # 增加耐心值，因为预训练可能需要更长时间
 
         # 优化器参数
         self.base_lr = 1e-4
@@ -1422,25 +1397,27 @@ class Args:
         self.weight_decay = 1e-4
 
         # 损失函数参数
+        self.weight_diagnosis = 1.0
+        self.weight_change = 1.0
         self.label_smoothing = 0.1
 
         # 训练阶段参数
-        self.pretrain_epochs = 50 if task_type == 'binary' else 75
+        self.pretrain_epochs = 50  # 预训练轮数
 
         # SimMIM参数
-        self.mask_ratio = 0.6
-        self.patch_size = 4
-        self.img_size = 256
-        self.norm_target = True
-        self.norm_target_patch_size = 47
+        self.mask_ratio = 0.6  # mask比例
+        self.patch_size = 4    # patch大小
+        self.img_size = 256    # 图像大小
+        self.norm_target = True  # 是否标准化目标
+        self.norm_target_patch_size = 47  # 标准化patch大小
 
         # wandb参数
-        self.wandb_project = f"alzheimer-single-task-{task_type}"
-        self.exp_name = f"single-task-{task_type}-{num_classes}class"
+        self.wandb_project = "alzheimer-mmoe-nine-label"
+        self.exp_name = "dual-task-mmoe-simmim-7class"
 
         # 权重加载参数
-        self.resume = None
-        self.pretrained = None
+        self.resume = None  # 恢复训练的checkpoint路径
+        self.pretrained = None  # 预训练权重路径
 
         # 数据参数
         self.DATA = type('obj', (object,), {
@@ -1452,34 +1429,18 @@ class Args:
             'PIN_MEMORY': True
         })
 
+        # 类别数量
+        self.num_classes_diagnosis = 3  # CN, MCI, AD
+        self.num_classes_change = 7     # 7个细化的change类别
+
 
 if __name__ == "__main__":
     # 示例用法
-    print("=" * 80)
-    print("Single Task Trainer Examples")
-    print("=" * 80)
+    args = Args()
+    # 设置预训练权重路径（如果有的话）
+    # args.pretrained = "path/to/pretrained_weights.pth"
+    # args.resume = "path/to/checkpoint.pth"  # 如果要恢复训练
 
-    # 二分类示例
-    print("\n1. Binary Classification (CN vs AD):")
-    binary_args = Args(task_type='binary', num_classes=2)
-    print(f"   Task: {binary_args.task_type}")
-    print(f"   Classes: {binary_args.class_names}")
-    print(f"   Pretrain epochs: {binary_args.pretrain_epochs}")
-    print(f"   WandB project: {binary_args.wandb_project}")
-
-    # 三分类示例
-    print("\n2. Three-class Classification (CN/MCI/AD):")
-    three_args = Args(task_type='diagnosis', num_classes=3)
-    print(f"   Task: {three_args.task_type}")
-    print(f"   Classes: {three_args.class_names}")
-    print(f"   Pretrain epochs: {three_args.pretrain_epochs}")
-    print(f"   WandB project: {three_args.wandb_project}")
-
-    print("\n3. Usage:")
-    print("   # from models.swin_transformer_v2_mtad_ptft_single_task import SwinTransformerV2_SingleTask")
-    print("   # model = SwinTransformerV2_SingleTask(num_classes=2)")
-    print("   # trainer_alzheimer_single_task(binary_args, model, './checkpoints/binary_exp')")
-
-    print("\n" + "=" * 80)
-    print("Single Task Trainer Ready!")
-    print("=" * 80)
+    # model = SwinTransformerV2_AlzheimerMMoE_NineLabel(...)
+    # snapshot_path = "./checkpoints/mmoe_nine_label_exp1"
+    # trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path)

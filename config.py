@@ -175,7 +175,10 @@ _C.MODEL.SWIN_ADMOE.PRIOR_DIM = 3
 _C.MODEL.SWIN_ADMOE.PRIOR_HIDDEN_DIM = 128
 _C.MODEL.SWIN_ADMOE.FUSION_STAGE = 2
 _C.MODEL.SWIN_ADMOE.FUSION_TYPE = 'adaptive'
-
+# ShiftedBlock parameters
+_C.MODEL.SWIN_ADMOE.USE_TOKENMLP_VERSION = False  # token MLP version of ShiftedBlock
+_C.MODEL.SWIN_ADMOE.USE_SHIFTED_LAST_LAYER = False  # whether use ShiftedBlock
+_C.MODEL.SWIN_ADMOE.SHIFT_MLP_RATIO = 1.0  # ShiftedBlock MLP ratio
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------

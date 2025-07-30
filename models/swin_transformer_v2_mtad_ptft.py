@@ -170,8 +170,6 @@ class AlzheimerMMoE(nn.Module):
             reconstruction_output = torch.sum(expert_outputs * reconstruction_weights_expanded, dim=-1)  # [B, L, dim]
             return reconstruction_output
 
-        # ===== 双任务分类模式 =====
-
         # === 诊断任务专家路由 ===
         if is_pretrain and lbls_diagnosis is not None:
             # 预训练阶段：基于标签的先验路由

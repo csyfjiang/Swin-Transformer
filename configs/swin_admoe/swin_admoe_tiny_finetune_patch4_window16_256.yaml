@@ -1,21 +1,21 @@
-# Alzheimer's Disease Dual-Task Classification with SimMIM Pretraining Configuration
-# config/swin_admoe_tiny_simmim_patch4_window16_256.yaml
+# Alzheimer's Disease Dual-Task Classification with TokenMLP/ShiftedBlock Configuration
+# Uses the improved version with ShiftedBlock in the last layer
 
 DATA:
   DATASET: 'alzheimer'
-  DATA_PATH: '../data/slice'  # Windows path D://codebase//Swin-Transformer//examples Z://yufengjiang//data//slice data/external_slices_for_pt_ft
+  DATA_PATH: '../data/slice'  # Windows path D://codebase//Swin-Transformer//examples Z://yufengjiang//data//slice data/external_slices_for_pt_ft ../data/slice
   IMG_SIZE: 256
-  BATCH_SIZE: 224
+  BATCH_SIZE: 6
   NUM_WORKERS: 4
   PIN_MEMORY: True
   INTERPOLATION: 'bicubic'
-  # 添加阶段特定的batch size
-  BATCH_SIZE_PRETRAIN: 384  # 预训练阶段的batch size
-  BATCH_SIZE_FINETUNE: 224  # 微调阶段的batch size
+  # Phase-specific batch sizes
+#  BATCH_SIZE_PRETRAIN: 4  # Batch size for pretraining phase
+#  BATCH_SIZE_FINETUNE: 6  # Batch size for finetuning phase
 
 MODEL:
-  TYPE: swin_admoe
-  NAME: swin_admoe_tiny_simmim_patch4_window16_256
+  TYPE: swin_admoe  # Keep original type
+  NAME: swin_admoe_tokenmlp_tiny_patch4_window16_256
   NUM_CLASSES: 3  # Keep for compatibility
   DROP_RATE: 0.0
   DROP_PATH_RATE: 0.1
@@ -29,12 +29,15 @@ MODEL:
       PATCH_SIZE: 47 # Patch size for target normalization
 
   SWIN_ADMOE:
+    # Enable new version
+    USE_TOKENMLP_VERSION: True  # Key config: Enable TokenMLP version
+    USE_SHIFTED_LAST_LAYER: True  # Key config: Use ShiftedBlock in last layer
+    SHIFT_MLP_RATIO: 1.0  # MLP ratio for ShiftedBlock
+
     # Dual-task class numbers
-    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3) for 3 classes, CN(0), AD(1) for 2 classes
+    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3) for 3 classes
     NUM_CLASSES_CHANGE: 3     # Stable(1), Conversion(2), Reversion(3)
-    # Label availability settings
-    # DIAGNOSIS_LABEL_AVAILABLE: True   # Whether diagnosis labels are available
-    # CHANGE_LABEL_AVAILABLE: False
+
     # Model architecture parameters
     PATCH_SIZE: 4
     IN_CHANS: 3
@@ -47,9 +50,7 @@ MODEL:
     APE: False
     PATCH_NORM: True
     PRETRAINED_WINDOW_SIZES: [8, 8, 8, 4]
-    SHIFT_MLP_RATIO: 1.0
     IS_PRETRAIN: True   # Start with pretraining mode
-    USE_SHIFTED_LAST_LAYER: False
 
     # Clinical Prior Settings
     USE_CLINICAL_PRIOR: True
@@ -83,7 +84,7 @@ TRAIN:
   EPOCHS: 200
 
   # Phase-specific settings
-  PRETRAIN_EPOCHS: 50  # First 100 epochs for SimMIM pretraining
+  PRETRAIN_EPOCHS: 0 # First 50 epochs for SimMIM pretraining
 
   # Learning rate settings
   BASE_LR: 1e-4         # Base learning rate
@@ -127,8 +128,8 @@ AMP_ENABLE: True
 
 # Basic settings
 SEED: 42
-OUTPUT: './output/alzheimer_simmim_dual_task'
-TAG: 'simmim_pretrain_dual_task_v1'
+OUTPUT: './output/alzheimer_tokenmlp_dual_task'
+TAG: 'tokenmlp_shifted_v1'
 SAVE_FREQ: 20  # Save every 20 epochs
 PRINT_FREQ: 50
 EVAL_MODE: False
@@ -141,9 +142,9 @@ FUSED_LAYERNORM: False
 
 # WandB settings
 WANDB:
-  PROJECT: 'alzheimer-simmim-dual-classification'
-  NAME: 'swin_admoe_simmim_pretrain'
-  TAGS: ['simmim', 'dual-task', 'alzheimer', 'swin-admoe', 'pretraining']
+  PROJECT: 'alzheimer-tokenmlp-dual-classification'
+  NAME: 'swin_admoe_tokenmlp_shifted'
+  TAGS: ['tokenmlp', 'shifted', 'dual-task', 'alzheimer', 'swin-admoe', 'pretraining']
 
 # Loss weights (for finetuning phase)
 LOSS:
@@ -152,7 +153,7 @@ LOSS:
 
 # Evaluation settings
 EVAL:
-  INTERVAL: 25  # Validate every 10 epochs
+  INTERVAL: 25  # Validate every 25 epochs
   SAVE_BEST: True
   METRICS: ['accuracy', 'f1_score', 'confusion_matrix']
 
@@ -165,13 +166,13 @@ EARLY_STOP:
 # Phase-specific configurations
 PHASES:
   PRETRAIN:
-    DESCRIPTION: "SimMIM self-supervised pretraining"
+    DESCRIPTION: "SimMIM self-supervised pretraining with TokenMLP"
     LOSS_TYPE: "reconstruction"
     EXPERT_ASSIGNMENT: "label_based"  # Assign experts based on diagnosis labels
     EVALUATION_METRIC: "reconstruction_loss"
 
   FINETUNE:
-    DESCRIPTION: "Dual-task classification finetuning"
+    DESCRIPTION: "Dual-task classification finetuning with ShiftedBlock"
     LOSS_TYPE: "classification"
     EXPERT_ASSIGNMENT: "learned_gating"  # Use learned adaptive gating
     EVALUATION_METRIC: "classification_accuracy"
